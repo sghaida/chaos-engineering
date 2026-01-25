@@ -454,6 +454,7 @@ func testFIActionInboundLatency(actionName, vsName string, percent int64, delayS
 	}
 }
 
+//nolint:unparam // actionName kept for readability in test helpers
 func testFIActionOutboundLatency(actionName string, hosts []string, percent int64, delaySeconds int64, sourceLabels map[string]string) func(*unstructured.Unstructured) {
 	return func(fi *unstructured.Unstructured) {
 		spec := testGetOrCreateMap(fi, "spec")
@@ -530,6 +531,7 @@ func testGetOrCreateSliceFrom(parent map[string]any, key string) []any {
 	return s
 }
 
+//nolint:unparam // namespace kept explicit to mirror production object shape
 func testFetchFI(ctx context.Context, namespace, name string) *unstructured.Unstructured {
 	fi := testNewFaultInjectionUnstructured(namespace, name)
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, fi)).To(Succeed())

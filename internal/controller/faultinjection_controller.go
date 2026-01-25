@@ -53,6 +53,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -68,6 +69,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	// ErrorPhase indicates the FaultInjection is in an error state.
+	ErrorPhase = "Error"
+	// RunningPhase indicates the FaultInjection is currently running.
+	RunningPhase = "Running"
+	// CompletedPhase indicates the FaultInjection has completed successfully.
+	CompletedPhase = "Completed"
+	// INBOUNDDirection Direction constants
+	INBOUNDDirection = "INBOUND"
+	// OUTBOUNDDirection Direction constants
+	OUTBOUNDDirection = "OUTBOUND"
+	// HTTPLatency  Action type constants
+	HTTPLatency = "HTTP_LATENCY"
+	// HTTPAbort  Action type constants
+	HTTPAbort = "HTTP_ABORT"
 )
 
 // FaultInjectionReconciler reconciles chaos.sghaida.io/v1alpha1 FaultInjection resources.
@@ -151,7 +169,7 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		t := metav1.NewTime(now)
 		fi.Status.StartedAt = &t
 	}
-	expiresAt := fi.Status.StartedAt.Time.Add(time.Duration(fi.Spec.BlastRadius.DurationSeconds) * time.Second)
+	expiresAt := fi.Status.StartedAt.Add(time.Duration(fi.Spec.BlastRadius.DurationSeconds) * time.Second)
 	t := metav1.NewTime(expiresAt)
 	fi.Status.ExpiresAt = &t
 
@@ -170,7 +188,7 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// 2) Guardrails
 	if err := r.validateSpec(ctx, &fi); err != nil {
 		_ = r.cleanupAll(ctx, &fi)
-		fi.Status.Phase = "Error"
+		fi.Status.Phase = ErrorPhase
 		fi.Status.Message = err.Error()
 		_ = r.Status().Update(ctx, &fi)
 		return ctrl.Result{}, nil
@@ -185,7 +203,7 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 		vs, created, err := r.getOrCreateVirtualService(ctx, &fi, vsNS, vsName, desired)
 		if err != nil {
-			fi.Status.Phase = "Error"
+			fi.Status.Phase = ErrorPhase
 			fi.Status.Message = fmt.Sprintf("failed getting/creating VirtualService %s/%s: %v", vsNS, vsName, err)
 			_ = r.Status().Update(ctx, &fi)
 			return ctrl.Result{}, err
@@ -208,7 +226,7 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				baseRoute = buildManagedOutboundDefaultRoute(desired.Hosts)
 				ensureVSHasAtLeastOneDefaultRouteRule(vs, desired.Hosts)
 			} else {
-				fi.Status.Phase = "Error"
+				fi.Status.Phase = ErrorPhase
 				fi.Status.Message = fmt.Sprintf("target VirtualService %s/%s has no route/redirect/direct_response in any http rule; cannot inject faults safely", vsNS, vsName)
 				_ = r.Status().Update(ctx, &fi)
 				return ctrl.Result{}, nil
@@ -223,13 +241,7 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			desiredRules = append(desiredRules, rule)
 		}
 
-		changed, err := patchVirtualServiceHTTP(vs, fiRuleNamePrefix(&fi), desiredRules)
-		if err != nil {
-			fi.Status.Phase = "Error"
-			fi.Status.Message = fmt.Sprintf("failed patching VirtualService %s/%s: %v", vsNS, vsName, err)
-			_ = r.Status().Update(ctx, &fi)
-			return ctrl.Result{}, err
-		}
+		changed := patchVirtualServiceHTTP(vs, fiRuleNamePrefix(&fi), desiredRules)
 
 		if created || changed || meshGatewayChanged {
 			if err := r.Update(ctx, vs); err != nil {
@@ -297,11 +309,11 @@ func (r *FaultInjectionReconciler) validateSpec(ctx context.Context, fi *chaosv1
 		}
 
 		switch a.Type {
-		case "HTTP_LATENCY":
+		case HTTPLatency:
 			if a.HTTP.Delay == nil || a.HTTP.Delay.FixedDelaySeconds <= 0 {
 				return fmt.Errorf("action %q requires http.delay.fixedDelaySeconds for HTTP_LATENCY", a.Name)
 			}
-		case "HTTP_ABORT":
+		case HTTPAbort:
 			if a.HTTP.Abort == nil || a.HTTP.Abort.HTTPStatus < 100 {
 				return fmt.Errorf("action %q requires http.abort.httpStatus for HTTP_ABORT", a.Name)
 			}
@@ -317,11 +329,11 @@ func (r *FaultInjectionReconciler) validateSpec(ctx context.Context, fi *chaosv1
 		}
 
 		switch a.Direction {
-		case "INBOUND":
+		case INBOUNDDirection:
 			if a.HTTP.VirtualServiceRef == nil || strings.TrimSpace(a.HTTP.VirtualServiceRef.Name) == "" {
 				return fmt.Errorf("action %q (INBOUND) requires http.virtualServiceRef.name", a.Name)
 			}
-		case "OUTBOUND":
+		case OUTBOUNDDirection:
 			if len(a.HTTP.DestinationHosts) == 0 {
 				return fmt.Errorf("action %q (OUTBOUND) requires http.destinationHosts", a.Name)
 			}
@@ -403,7 +415,7 @@ func (r *FaultInjectionReconciler) buildDesiredByVSTarget(fi *chaosv1alpha1.Faul
 
 	for _, a := range fi.Spec.Actions.MeshFaults {
 		switch a.Direction {
-		case "INBOUND":
+		case INBOUNDDirection:
 			vsName := a.HTTP.VirtualServiceRef.Name
 			key := joinKey(fi.Namespace, vsName)
 
@@ -412,7 +424,7 @@ func (r *FaultInjectionReconciler) buildDesiredByVSTarget(fi *chaosv1alpha1.Faul
 			d.Rules = append(d.Rules, rule)
 			byTarget[key] = d
 
-		case "OUTBOUND":
+		case OUTBOUNDDirection:
 			vsName := managedOutboundVSName(fi, &a)
 			key := joinKey(fi.Namespace, vsName)
 
@@ -557,7 +569,7 @@ func virtualServiceGVK() schema.GroupVersionKind {
 //
 // It returns changed=true when the effective .spec.http list differs from the current
 // value. Non-map items inside the http list are preserved as-is.
-func patchVirtualServiceHTTP(vs *unstructured.Unstructured, injectedPrefix string, desiredRules []map[string]any) (bool, error) {
+func patchVirtualServiceHTTP(vs *unstructured.Unstructured, injectedPrefix string, desiredRules []map[string]any) bool {
 	spec, ok := vs.Object["spec"].(map[string]any)
 	if !ok {
 		spec = map[string]any{}
@@ -593,7 +605,7 @@ func patchVirtualServiceHTTP(vs *unstructured.Unstructured, injectedPrefix strin
 	changed := !deepEqualHTTP(existing, newHTTP)
 	spec["http"] = newHTTP
 	vs.Object["spec"] = spec
-	return changed, nil
+	return changed
 }
 
 // deepEqualHTTP performs a conservative equality check on two unstructured HTTP rule lists.
@@ -845,10 +857,7 @@ func (r *FaultInjectionReconciler) cleanupAll(ctx context.Context, fi *chaosv1al
 			return err
 		}
 
-		changed, err := patchVirtualServiceHTTP(vs, prefix, nil)
-		if err != nil {
-			return err
-		}
+		changed := patchVirtualServiceHTTP(vs, prefix, nil)
 
 		labels := vs.GetLabels()
 		if labels != nil && labels["managed-by"] == "fi-operator" && labels["chaos.sghaida.io/fi"] == fi.Name {
@@ -1072,13 +1081,9 @@ func getString(m map[string]any, k string) string {
 // is needed in the future, this function can be extended to recursively copy nested
 // maps/slices.
 func cloneAnySlice(in []any) []any {
-	out := make([]any, 0, len(in))
-	for _, v := range in {
-		// shallow clone elements; for our purpose it’s enough (dest maps remain shared).
-		// If you want deep clone, we can recursively copy.
-		out = append(out, v)
-	}
-	return out
+	// shallow clone elements; for our purpose it’s enough (dest maps remain shared).
+	// If you want deep clone, we can recursively copy.
+	return append([]any(nil), in...)
 }
 
 // cloneMap returns a shallow copy of a map[string]any.
@@ -1086,8 +1091,6 @@ func cloneAnySlice(in []any) []any {
 // Nested objects are not deep-copied.
 func cloneMap(in map[string]any) map[string]any {
 	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
+	maps.Copy(out, in)
 	return out
 }
