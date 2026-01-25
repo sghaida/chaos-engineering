@@ -1,0 +1,339 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: faultinjections.chaos.sghaida.io
+spec:
+  group: chaos.sghaida.io
+  names:
+    kind: FaultInjection
+    listKind: FaultInjectionList
+    plural: faultinjections
+    singular: faultinjection
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: FaultInjection is the Schema for the faultinjections API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Spec defines the desired state of the FaultInjection.
+            properties:
+              actions:
+                description: |-
+                  Actions defines the concrete chaos actions to execute.
+                  At least one mesh fault must be specified.
+                properties:
+                  meshFaults:
+                    description: |-
+                      MeshFaults defines Istio-based HTTP fault injections.
+                      Each entry is executed independently.
+                    items:
+                      description: |-
+                        MeshFaultAction defines a single HTTP fault injection action applied
+                        either to inbound or outbound traffic.
+
+                        Each MeshFaultAction:
+                        - targets exactly one traffic direction (INBOUND or OUTBOUND)
+                        - affects a bounded percentage of traffic
+                        - is independently cleaned up by name
+                      properties:
+                        direction:
+                          description: |-
+                            Direction specifies whether the fault applies to inbound
+                            traffic (requests entering the service) or outbound traffic
+                            (requests leaving the service to a dependency).
+
+                            INBOUND  → patch an existing VirtualService for the service
+                            OUTBOUND → patch or create a VirtualService targeting the destination host
+                          enum:
+                          - INBOUND
+                          - OUTBOUND
+                          type: string
+                        http:
+                          description: HTTP defines how the fault is applied at the
+                            HTTP routing layer.
+                          properties:
+                            abort:
+                              description: |-
+                                Abort defines HTTP abort (error) injection.
+                                Required for HTTP_ABORT.
+                              properties:
+                                httpStatus:
+                                  description: |-
+                                    HTTPStatus is the HTTP response code returned for aborted requests.
+                                    Valid range: 100–599
+                                  format: int32
+                                  maximum: 599
+                                  minimum: 100
+                                  type: integer
+                              required:
+                              - httpStatus
+                              type: object
+                            delay:
+                              description: |-
+                                Delay defines fixed latency injection.
+                                Required for HTTP_LATENCY.
+                              properties:
+                                fixedDelaySeconds:
+                                  description: |-
+                                    FixedDelaySeconds is the artificial latency added to matching requests.
+                                    Example: 2 → "2s"
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                              required:
+                              - fixedDelaySeconds
+                              type: object
+                            destinationHosts:
+                              description: |-
+                                DestinationHosts defines the destination hostnames for outbound faults.
+
+                                These are typically external domains (e.g. api.vendor.com) or
+                                internal service hostnames.
+
+                                Required when direction=OUTBOUND.
+                              items:
+                                type: string
+                              maxItems: 32
+                              type: array
+                            routes:
+                              description: |-
+                                Routes define HTTP match conditions under which the fault applies.
+                                These routes are prepended before existing VirtualService rules.
+                              items:
+                                description: HTTPRouteTarget defines a single HTTP
+                                  routing match.
+                                properties:
+                                  match:
+                                    description: Match defines how incoming requests
+                                      are matched.
+                                    properties:
+                                      headers:
+                                        additionalProperties:
+                                          type: string
+                                        description: Headers defines optional exact-match
+                                          HTTP headers.
+                                        type: object
+                                      uriExact:
+                                        description: |-
+                                          URIExact matches requests whose URI exactly equals this value.
+                                          Example: /VendorAPI/v1/orders
+                                        minLength: 1
+                                        type: string
+                                      uriPrefix:
+                                        description: |-
+                                          URIPrefix matches requests whose URI starts with this prefix.
+                                          Example: /VendorAPI
+                                        minLength: 1
+                                        type: string
+                                    type: object
+                                required:
+                                - match
+                                type: object
+                              minItems: 1
+                              type: array
+                            sourceSelector:
+                              description: |-
+                                SourceSelector restricts OUTBOUND faults to traffic originating
+                                from workloads matching these labels.
+
+                                Strongly recommended to avoid impacting all mesh workloads.
+                              properties:
+                                matchLabels:
+                                  additionalProperties:
+                                    type: string
+                                  description: |-
+                                    MatchLabels restricts matching to workloads
+                                    that have all of the specified labels.
+                                  minProperties: 1
+                                  type: object
+                              required:
+                              - matchLabels
+                              type: object
+                            timeout:
+                              description: |-
+                                Timeout defines an HTTP route timeout.
+
+                                Note:
+                                Istio timeouts are not percentage-based.
+                                To simulate percentage-based timeouts, configure:
+                                  delay.fixedDelaySeconds > timeout.timeoutSeconds
+                              properties:
+                                timeoutSeconds:
+                                  description: |-
+                                    TimeoutSeconds is the maximum allowed duration for a request.
+                                    Example: 1 → "1s"
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                              required:
+                              - timeoutSeconds
+                              type: object
+                            virtualServiceRef:
+                              description: |-
+                                VirtualServiceRef references an existing VirtualService to patch.
+
+                                Required when direction=INBOUND.
+                                Optional when direction=OUTBOUND.
+                              properties:
+                                name:
+                                  description: Name of the VirtualService.
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                          required:
+                          - routes
+                          type: object
+                        name:
+                          description: |-
+                            Name uniquely identifies this fault within the FaultInjection.
+
+                            It is used to generate deterministic VirtualService rule names,
+                            enabling safe updates and cleanup.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        percent:
+                          description: |-
+                            Percent defines the percentage of matching traffic
+                            affected by this fault.
+
+                            This value MUST be <= blastRadius.maxTrafficPercent.
+                          format: int32
+                          maximum: 100
+                          minimum: 0
+                          type: integer
+                        type:
+                          description: |-
+                            Type defines the kind of HTTP fault to inject.
+
+                            HTTP_LATENCY → fixed delay injection
+                            HTTP_ABORT   → HTTP error response injection
+                          enum:
+                          - HTTP_LATENCY
+                          - HTTP_ABORT
+                          type: string
+                      required:
+                      - direction
+                      - http
+                      - name
+                      - percent
+                      - type
+                      type: object
+                    minItems: 1
+                    type: array
+                required:
+                - meshFaults
+                type: object
+              blastRadius:
+                description: |-
+                  BlastRadius defines temporal and safety constraints for the experiment.
+                  The controller MUST enforce these limits.
+                properties:
+                  durationSeconds:
+                    description: |-
+                      DurationSeconds is the total runtime of the experiment.
+                      After this duration expires, all injected faults are automatically cleaned up.
+
+                      Example: 300 (5 minutes)
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  maxPodsAffected:
+                    description: |-
+                      MaxPodsAffected is a safety guardrail limiting the number of pods
+                      that may be impacted by the experiment.
+
+                      This is enforced using http.sourceSelector.matchLabels on actions.
+                      If set and the controller cannot safely estimate affected pods,
+                      the experiment will be aborted.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  maxTrafficPercent:
+                    description: |-
+                      MaxTrafficPercent is an upper bound on how much traffic
+                      any mesh fault is allowed to affect.
+
+                      Each meshFault.percent MUST be <= this value.
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  scope:
+                    description: |-
+                      Scope is informational for now and reserved for future policy enforcement.
+                      Currently only "namespace" is supported.
+                    enum:
+                    - namespace
+                    type: string
+                required:
+                - durationSeconds
+                - maxTrafficPercent
+                type: object
+            required:
+            - actions
+            - blastRadius
+            type: object
+          status:
+            description: Status reflects the observed state of the FaultInjection.
+            properties:
+              expiresAt:
+                description: ExpiresAt is the timestamp when the experiment is scheduled
+                  to end.
+                format: date-time
+                type: string
+              message:
+                description: Message provides a human-readable status explanation.
+                type: string
+              phase:
+                description: |-
+                  Phase represents the current lifecycle phase of the experiment.
+
+                  Possible values:
+                  - Pending
+                  - Running
+                  - Completed
+                  - Error
+                enum:
+                - Pending
+                - Running
+                - Completed
+                - Error
+                type: string
+              startedAt:
+                description: StartedAt is the timestamp when the experiment actually
+                  began.
+                format: date-time
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
