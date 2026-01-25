@@ -1,16 +1,10 @@
 # Network Fault Injector
 
-[![Go](https://img.shields.io/badge/Go-1.24%2B-blue)](https://go.dev/) [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.27%2B-blue)](https://kubernetes.io/) [![Istio](https://img.shields.io/badge/Istio-Envoy-informational)](https://istio.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE) [![Status](https://img.shields.io/badge/status-experimental-orange)](#)
-
-Here’s a **clean, GitHub-compatible Table of Contents** that matches **your README exactly** (headings, casing, emojis, duplicates handled).
-
-You can paste this **right after the badges section**, before the first `##`.
+[![Go](https://img.shields.io/badge/Go-1.24%2B-blue)](https://go.dev/) [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.27%2B-blue)](https://kubernetes.io/) [![Istio](https://img.shields.io/badge/Istio-Envoy-informational)](https://istio.io/) [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE) [![Status](https://img.shields.io/badge/status-experimental-orange)](#) ![CI](https://github.com/sghaida/chaos-engineering/actions/workflows/test.yml/badge.svg)
 
 ---
 
 ## Table of Contents
-
-> ✅ **Use this TOC instead of the broken one** (remove the duplicate `## Table of Contents` lines and the self-referential entries).
 
 - [Network Fault Injector](#network-fault-injector)
   - [Table of Contents](#table-of-contents)
