@@ -580,6 +580,7 @@ func testNewDeployment(namespace, name string) *unstructured.Unstructured {
 	return d
 }
 
+//nolint:unparam
 func testNewDeploymentUnstructured(namespace, name string, owners []metav1.OwnerReference) *unstructured.Unstructured {
 	d := testNewDeployment(namespace, name)
 	d.SetOwnerReferences(owners)
@@ -622,6 +623,7 @@ func testFIBlastRadius(durationSeconds int64, maxTrafficPercent int64, maxPodsAf
 	}
 }
 
+//nolint:unparam
 func testFIActionInboundLatency(actionName, vsName string, percent int64, delaySeconds int64) func(*unstructured.Unstructured) {
 	return func(fi *unstructured.Unstructured) {
 		spec := testGetOrCreateMap(fi, "spec")
@@ -702,6 +704,7 @@ func testFIActionOutboundLatency(actionName string, hosts []string, percent int6
 	}
 }
 
+//nolint:unparam
 func testGetOrCreateMap(u *unstructured.Unstructured, key string) map[string]any {
 	m, ok := u.Object[key].(map[string]any)
 	if !ok || m == nil {

@@ -72,7 +72,7 @@ var _ = Describe("FaultInjection API types", func() {
 		spec2 := m2["spec"].(map[string]any)
 		v, hasCancel2 := spec2["cancel"]
 		Expect(hasCancel2).To(BeTrue(), "cancel should be present when true")
-		Expect(v).To(Equal(true))
+		Expect(v).To(BeTrue())
 	})
 
 	It("omits optional fields when unset (stopConditions, blastRadius.scope)", func() {

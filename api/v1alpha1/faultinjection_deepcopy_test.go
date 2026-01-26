@@ -9,6 +9,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+const (
+	changed = "CHANGED"
+)
+
 var _ = Describe("DeepCopy / Scheme", func() {
 	It("DeepCopy creates an independent copy of FaultInjection (no shared pointers/slices)", func() {
 		fi := &FaultInjection{
@@ -73,12 +77,11 @@ var _ = Describe("DeepCopy / Scheme", func() {
 		Expect(cp).NotTo(BeIdenticalTo(fi))
 
 		// mutate original and ensure copy doesn't change
-		fi.Labels["a"] = "CHANGED"
-		fi.Spec.Actions.MeshFaults[0].Name = "CHANGED"
-		fi.Spec.Actions.MeshFaults[0].HTTP.Routes[0].Match.Headers["x"] = "CHANGED"
-		fi.Spec.StopConditions.Rules[0].Name = "CHANGED"
-		fi.Spec.Actions.MeshFaults[0].HTTP.VirtualServiceRef.Name = "CHANGED"
-
+		fi.Labels["a"] = changed
+		fi.Spec.Actions.MeshFaults[0].Name = changed
+		fi.Spec.Actions.MeshFaults[0].HTTP.Routes[0].Match.Headers["x"] = changed
+		fi.Spec.StopConditions.Rules[0].Name = changed
+		fi.Spec.Actions.MeshFaults[0].HTTP.VirtualServiceRef.Name = changed
 		Expect(cp.Labels["a"]).To(Equal("b"))
 		Expect(cp.Spec.Actions.MeshFaults[0].Name).To(Equal("a1"))
 		Expect(cp.Spec.Actions.MeshFaults[0].HTTP.Routes[0].Match.Headers["x"]).To(Equal("y"))
@@ -220,13 +223,13 @@ var _ = Describe("DeepCopy / Scheme", func() {
 		Expect(into.Spec.Actions.MeshFaults).To(HaveLen(1))
 
 		// mutate copy and ensure original is unchanged (maps/slices/pointers)
-		into.Labels["a"] = "CHANGED"
+		into.Labels["a"] = changed
 		Expect(fi.Labels["a"]).To(Equal("b"))
 
-		into.Spec.Actions.MeshFaults[0].HTTP.DestinationHosts[0] = "CHANGED"
+		into.Spec.Actions.MeshFaults[0].HTTP.DestinationHosts[0] = changed
 		Expect(fi.Spec.Actions.MeshFaults[0].HTTP.DestinationHosts[0]).To(Equal("example.com"))
 
-		into.Spec.Actions.MeshFaults[0].HTTP.SourceSelector.MatchLabels["app"] = "CHANGED"
+		into.Spec.Actions.MeshFaults[0].HTTP.SourceSelector.MatchLabels["app"] = changed
 		Expect(fi.Spec.Actions.MeshFaults[0].HTTP.SourceSelector.MatchLabels["app"]).To(Equal("curl-client"))
 
 		By("DeepCopy returns a new instance")
@@ -261,9 +264,6 @@ var _ = Describe("DeepCopy / Scheme", func() {
 		lstObj := lst.DeepCopyObject()
 		Expect(lstObj).NotTo(BeNil())
 
-		_, ok = lstObj.(runtime.Object)
-		Expect(ok).To(BeTrue())
-
 		lst2 := lst.DeepCopy()
 		Expect(lst2).NotTo(BeNil())
 		Expect(lst2).NotTo(BeIdenticalTo(lst))
@@ -272,23 +272,30 @@ var _ = Describe("DeepCopy / Scheme", func() {
 		lst2.Items[0].Spec.BlastRadius.MaxPodsAffected = 999
 		Expect(lst.Items[0].Spec.BlastRadius.MaxPodsAffected).To(Equal(int64(2)))
 
-		By("Also hit DeepCopy/Into for small leaf structs explicitly (common 0% entries)")
-		// These calls are redundant logically but ensure coverage for generated methods
-		var md MetricRef
-		fi.Spec.StopConditions.Rules[1].Structured.Metric.DeepCopyInto(&md)
-		Expect(md.Name).To(Equal("http_request_duration_seconds_bucket"))
+		By("DeepCopy should deep-copy nested StopConditions fields (maps/slices/pointers) even when leaf types have no DeepCopy methods")
+		// IMPORTANT:
+		// controller-gen does NOT generate DeepCopy methods for leaf structs like MetricRef/MetricQuery/MetricMatch/MetricCompare,
+		// so we validate deep-copy behavior by mutating those nested fields in the copied object and asserting the original is unchanged.
 
-		mq := fi.Spec.StopConditions.Rules[1].Structured.Query.DeepCopy()
-		Expect(mq).NotTo(BeNil())
-		Expect(mq.Kind).To(Equal("quantile"))
+		cp2 := fi.DeepCopy()
 
-		mm := fi.Spec.StopConditions.Rules[1].Structured.Match.DeepCopy()
-		Expect(mm).NotTo(BeNil())
-		Expect(mm.Labels["job"]).To(Equal("x"))
+		// mutate nested compare + structured query fields in the copy
+		cp2.Spec.StopConditions.Rules[0].Compare.Op = "LT"
+		cp2.Spec.StopConditions.Rules[0].Compare.Threshold = 999
 
-		cmp := fi.Spec.StopConditions.Rules[0].Compare.DeepCopy()
-		Expect(cmp).NotTo(BeNil())
-		Expect(cmp.Op).To(Equal("GT"))
+		cp2.Spec.StopConditions.Rules[1].Structured.Metric.Name = changed
+		cp2.Spec.StopConditions.Rules[1].Structured.Query.Kind = "rate"
+		cp2.Spec.StopConditions.Rules[1].Structured.Match.Labels["job"] = changed
+		cp2.Spec.StopConditions.Rules[1].Structured.Match.GroupBy[0] = changed
+
+		// original must stay the same
+		Expect(fi.Spec.StopConditions.Rules[0].Compare.Op).To(Equal("GT"))
+		Expect(fi.Spec.StopConditions.Rules[0].Compare.Threshold).To(Equal(float64(1)))
+
+		Expect(fi.Spec.StopConditions.Rules[1].Structured.Metric.Name).To(Equal("http_request_duration_seconds_bucket"))
+		Expect(fi.Spec.StopConditions.Rules[1].Structured.Query.Kind).To(Equal("quantile"))
+		Expect(fi.Spec.StopConditions.Rules[1].Structured.Match.Labels["job"]).To(Equal("x"))
+		Expect(fi.Spec.StopConditions.Rules[1].Structured.Match.GroupBy[0]).To(Equal("pod"))
 	})
 })
 
