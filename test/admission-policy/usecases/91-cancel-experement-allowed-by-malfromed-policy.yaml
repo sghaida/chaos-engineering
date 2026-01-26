@@ -1,0 +1,32 @@
+# ------------------------------------------------------------------------------
+# EXPECT: ALLOW
+# NOTE: This object is CRD-schema-valid, but would be denied by the admission policy
+#       due to delay/timeout > 300. With spec.cancel=true it must be allowed.
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-cancel-policy-only-malformed
+  namespace: demo
+spec:
+  cancel: true
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      - name: inbound-latency
+        direction: INBOUND
+        type: HTTP_LATENCY
+        percent: 10
+        http:
+          virtualServiceRef:
+            name: httpbin
+          routes:
+            - match:
+                uriPrefix: /
+          delay:
+            fixedDelaySeconds: 301
+          timeout:
+            timeoutSeconds: 301

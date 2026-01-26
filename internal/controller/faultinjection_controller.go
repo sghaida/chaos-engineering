@@ -78,6 +78,8 @@ const (
 	RunningPhase = "Running"
 	// CompletedPhase indicates the FaultInjection has completed successfully.
 	CompletedPhase = "Completed"
+	// CancelledPhase indicates the FaultInjection has been cancelled externally.
+	CancelledPhase = "Cancelled"
 	// INBOUNDDirection Direction constants
 	INBOUNDDirection = "INBOUND"
 	// OUTBOUNDDirection Direction constants
@@ -172,6 +174,30 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	expiresAt := fi.Status.StartedAt.Add(time.Duration(fi.Spec.BlastRadius.DurationSeconds) * time.Second)
 	t := metav1.NewTime(expiresAt)
 	fi.Status.ExpiresAt = &t
+
+	// Cancelled => immediate cleanup (GitOps/kubectl stop switch)
+	if fi.Spec.Cancel {
+		log.Info("experiment cancelled; cleaning up immediately", "name", fi.Name, "ns", fi.Namespace)
+
+		if err := r.cleanupAll(ctx, &fi); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		fi.Status.Phase = CancelledPhase
+		fi.Status.Message = "Cancelled: cleaned up injected rules"
+
+		// Set once (don’t keep changing timestamps/reason on repeated reconciles)
+		if fi.Status.CancelledAt == nil {
+			ct := metav1.NewTime(now)
+			fi.Status.CancelledAt = &ct
+		}
+		if fi.Status.StopReason == "" {
+			fi.Status.StopReason = "external: spec.cancel=true"
+		}
+
+		_ = r.Status().Update(ctx, &fi)
+		return ctrl.Result{}, nil
+	}
 
 	// Expired => cleanup
 	if now.After(fi.Status.ExpiresAt.Time) {
