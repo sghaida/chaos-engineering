@@ -176,6 +176,27 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	fi.Status.ExpiresAt = &t
 
 	// Cancelled => immediate cleanup (GitOps/kubectl stop switch)
+	// this could be triggered in one of the following ways:
+	//
+	// 1) Merge patch
+	// 		kubectl -n <namespace> patch faultinjection <experiment name> \
+	// 		--type=merge -p '{"spec":{"cancel":true}}'
+	//
+	// 2) JSON patch
+	//		kubectl -n <namespace> patch faultinjection <experiment name> \
+	//		--type=json -p='[{"op":"replace","path":"/spec/cancel","value":true}]'
+	// If spec.cancel already exists and you want to force it:
+	// 		kubectl -n <namespace> patch faultinjection <experiment name> \
+	//		--type=json -p='[{"op":"replace","path":"/spec/cancel","value":true}]'
+	//
+	// 3) Trigger cancellation via Argo CD sync
+	// spec:
+	//   cancel: true
+	// commit and push to Git repo monitored by CD
+	//
+	// 4) Emergency (live patch) — use with care
+	// You can patch live (like kubectl),
+	// but Argo will revert it back to git state on the next sync unless you also commit the change.
 	if fi.Spec.Cancel {
 		log.Info("experiment cancelled; cleaning up immediately", "name", fi.Name, "ns", fi.Namespace)
 

@@ -320,6 +320,204 @@ var _ = Describe("FaultInjection Controller", func() {
 		Expect(st["phase"]).To(Equal("Completed"))
 		Expect(st["message"]).To(ContainSubstring("Expired"))
 	})
+
+	It("cancellation cleans up immediately: removes injected rules, deletes managed VS, and deletes only Deployments owned by this FaultInjection", func() {
+		By("creating an inbound target VirtualService")
+		inboundVS := testNewInboundVirtualService(ns, "cancel-inbound-vs")
+		Expect(k8sClient.Create(ctx, inboundVS)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, testNewVirtualService(ns, "cancel-inbound-vs")) }()
+
+		By("creating a FaultInjection with INBOUND + OUTBOUND actions")
+		fi := testNewFaultInjectionUnstructured(ns, "fi-cancel",
+			testFIActionInboundLatency("in-latency", "cancel-inbound-vs", 10, 1),
+			testFIActionOutboundLatency("out-latency", []string{"example.com"}, 10, 1, map[string]string{"app": "a"}),
+			testFIBlastRadius(60, 100, 0),
+		)
+		Expect(k8sClient.Create(ctx, fi)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, fi)
+			_ = k8sClient.Delete(ctx, testNewVirtualService(ns, "fi-fi-cancel-out-latency"))
+		}()
+
+		controllerReconciler := &FaultInjectionReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+		By("reconciling once to apply faults (create managed VS + inject inbound rule)")
+		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "fi-cancel", Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("asserting inbound VS has an injected rule at the top")
+		gotInbound := testNewVirtualService(ns, "cancel-inbound-vs")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cancel-inbound-vs", Namespace: ns}, gotInbound)).To(Succeed())
+		http := testMustHTTPList(gotInbound)
+		Expect(http).NotTo(BeEmpty())
+		r0 := testMustRuleMap(http[0])
+		Expect(r0["name"].(string)).To(HavePrefix("fi-fi-cancel-"))
+
+		By("asserting managed outbound VS exists")
+		managedName := "fi-fi-cancel-out-latency"
+		gotManaged := testNewVirtualService(ns, managedName)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: managedName, Namespace: ns}, gotManaged)).To(Succeed())
+
+		By("creating deployments: owned, wrong-uid, and not-owned")
+		gotFI := testFetchFI(ctx, ns, "fi-cancel")
+		fiUID := gotFI.GetUID()
+		Expect(string(fiUID)).NotTo(BeEmpty())
+
+		ownedDep := testNewDeploymentUnstructured(ns, "cancel-owned-dep", []metav1.OwnerReference{
+			{
+				APIVersion: gotFI.GetAPIVersion(),
+				Kind:       gotFI.GetKind(),
+				Name:       gotFI.GetName(),
+				UID:        fiUID,
+			},
+		})
+		Expect(k8sClient.Create(ctx, ownedDep)).To(Succeed())
+
+		wrongUIDDep := testNewDeploymentUnstructured(ns, "cancel-wrong-uid-dep", []metav1.OwnerReference{
+			{
+				APIVersion: gotFI.GetAPIVersion(),
+				Kind:       gotFI.GetKind(),
+				Name:       gotFI.GetName(),
+				UID:        types.UID("different-uid"),
+			},
+		})
+		Expect(k8sClient.Create(ctx, wrongUIDDep)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, testNewDeployment(ns, "cancel-wrong-uid-dep")) }()
+
+		notOwnedDep := testNewDeploymentUnstructured(ns, "cancel-not-owned-dep", []metav1.OwnerReference{
+			{APIVersion: "v1", Kind: "ConfigMap", Name: "x", UID: types.UID("1111")},
+		})
+		Expect(k8sClient.Create(ctx, notOwnedDep)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, testNewDeployment(ns, "cancel-not-owned-dep")) }()
+
+		By("patching spec.cancel=true")
+		// Update the unstructured FI object and write it back.
+		fiToPatch := testFetchFI(ctx, ns, "fi-cancel")
+		spec := testGetOrCreateMap(fiToPatch, "spec")
+		spec["cancel"] = true
+		Expect(k8sClient.Update(ctx, fiToPatch)).To(Succeed())
+
+		By("reconciling again to trigger cancellation cleanup")
+		_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "fi-cancel", Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("verifying inbound VS no longer has injected rules")
+		Eventually(func() string {
+			v := testNewVirtualService(ns, "cancel-inbound-vs")
+			_ = k8sClient.Get(ctx, types.NamespacedName{Name: "cancel-inbound-vs", Namespace: ns}, v)
+			http := testMustHTTPList(v)
+			if len(http) == 0 {
+				return ""
+			}
+			r0 := testMustRuleMap(http[0])
+			n, _ := r0["name"].(string)
+			return n
+		}).Should(Equal("existing-route"))
+
+		By("verifying managed outbound VS is deleted")
+		Eventually(func() bool {
+			e := k8sClient.Get(ctx, types.NamespacedName{Name: managedName, Namespace: ns}, testNewVirtualService(ns, managedName))
+			return apierrors.IsNotFound(e)
+		}).Should(BeTrue())
+
+		By("verifying owned deployment is deleted but others remain")
+		Eventually(func() bool {
+			e := k8sClient.Get(ctx, types.NamespacedName{Name: "cancel-owned-dep", Namespace: ns}, testNewDeployment(ns, "cancel-owned-dep"))
+			return apierrors.IsNotFound(e)
+		}).Should(BeTrue())
+
+		Consistently(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: "cancel-wrong-uid-dep", Namespace: ns}, testNewDeployment(ns, "cancel-wrong-uid-dep"))
+		}).Should(Succeed())
+
+		Consistently(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: "cancel-not-owned-dep", Namespace: ns}, testNewDeployment(ns, "cancel-not-owned-dep"))
+		}).Should(Succeed())
+
+		By("verifying FaultInjection status is Cancelled with stopReason + cancelledAt")
+		fiFinal := testFetchFI(ctx, ns, "fi-cancel")
+		st := testGetStatusMap(fiFinal)
+		Expect(st["phase"]).To(Equal("Cancelled"))
+		Expect(st["message"]).To(ContainSubstring("Cancelled"))
+		Expect(st["cancelledAt"]).NotTo(BeNil())
+		Expect(st["stopReason"]).To(Equal("external: spec.cancel=true"))
+	})
+
+	It("cancellation is idempotent: repeated reconciles while spec.cancel=true do not change status.cancelledAt", func() {
+		By("creating an inbound target VirtualService")
+		inboundVS := testNewInboundVirtualService(ns, "cancel-idem-inbound-vs")
+		Expect(k8sClient.Create(ctx, inboundVS)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, testNewVirtualService(ns, "cancel-idem-inbound-vs")) }()
+
+		By("creating a FaultInjection and reconciling once to initialize status")
+		fi := testNewFaultInjectionUnstructured(ns, "fi-cancel-idem",
+			testFIActionInboundLatency("in-latency", "cancel-idem-inbound-vs", 10, 1),
+			testFIActionOutboundLatency("out-latency", []string{"example.com"}, 10, 1, map[string]string{"app": "a"}),
+			testFIBlastRadius(60, 100, 0),
+		)
+		Expect(k8sClient.Create(ctx, fi)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, fi)
+			_ = k8sClient.Delete(ctx, testNewVirtualService(ns, "fi-fi-cancel-idem-out-latency"))
+		}()
+
+		controllerReconciler := &FaultInjectionReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "fi-cancel-idem", Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("setting spec.cancel=true")
+		fiToPatch := testFetchFI(ctx, ns, "fi-cancel-idem")
+		spec := testGetOrCreateMap(fiToPatch, "spec")
+		spec["cancel"] = true
+		Expect(k8sClient.Update(ctx, fiToPatch)).To(Succeed())
+
+		By("reconciling to perform cancellation and capture cancelledAt")
+		_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "fi-cancel-idem", Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Wait until controller wrote status.cancelledAt
+		var firstCancelledAt string
+		Eventually(func() string {
+			fi2 := testFetchFI(ctx, ns, "fi-cancel-idem")
+			st := testGetStatusMap(fi2)
+
+			if st["phase"] != "Cancelled" {
+				return ""
+			}
+			ca, _ := st["cancelledAt"].(string)
+			return ca
+		}).ShouldNot(BeEmpty())
+
+		fi2 := testFetchFI(ctx, ns, "fi-cancel-idem")
+		st2 := testGetStatusMap(fi2)
+		firstCancelledAt, _ = st2["cancelledAt"].(string)
+		Expect(firstCancelledAt).NotTo(BeEmpty())
+
+		By("reconciling again while cancel=true")
+		_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "fi-cancel-idem", Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("verifying cancelledAt is unchanged")
+		fi3 := testFetchFI(ctx, ns, "fi-cancel-idem")
+		st3 := testGetStatusMap(fi3)
+		secondCancelledAt, _ := st3["cancelledAt"].(string)
+
+		Expect(st3["phase"]).To(Equal("Cancelled"))
+		Expect(secondCancelledAt).To(Equal(firstCancelledAt))
+		Expect(st3["stopReason"]).To(Equal("external: spec.cancel=true"))
+	})
+
 })
 
 /* -----------------------------
