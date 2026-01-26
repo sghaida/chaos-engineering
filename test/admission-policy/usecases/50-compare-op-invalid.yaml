@@ -1,0 +1,43 @@
+# ------------------------------------------------------------------------------
+# EXPECT: DENY
+# EXPECT_MSG_CONTAINS: The FaultInjection "fi-inbound-latency" is invalid: spec.stopConditions.rules[0].compare.op: Unsupported value: "GE": supported values: "GT", "GTE", "LT", "LTE", "EQ", "NEQ"
+# NOTE: Scenario: compare.op invalid
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-inbound-latency
+  namespace: demo
+spec:
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      -
+        name: inbound-latency
+        direction: INBOUND
+        type: HTTP_LATENCY
+        percent: 10
+        http:
+          virtualServiceRef:
+            name: httpbin
+          routes:
+            -
+              match:
+                uriPrefix: /
+          delay:
+            fixedDelaySeconds: 2
+  stopConditions:
+    defaults:
+      intervalSeconds: 10
+      windowSeconds: 60
+      consecutiveBreaches: 2
+    rules:
+      -
+        name: error-rate
+        promql: sum(rate(http_requests_total{code=~"5.."}[1m]))
+        compare:
+          op: GE
+          threshold: 1.0

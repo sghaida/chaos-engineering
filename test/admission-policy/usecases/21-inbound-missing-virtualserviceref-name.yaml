@@ -1,0 +1,31 @@
+# ------------------------------------------------------------------------------
+# EXPECT: DENY
+# EXPECT_MSG_CONTAINS: The FaultInjection "fi-inbound-latency" is invalid: spec.actions.meshFaults[0].http.virtualServiceRef.name: Invalid value: "": spec.actions.meshFaults[0].http.virtualServiceRef.name in body should be at least 1 chars lon
+# NOTE: Scenario: INBOUND missing virtualServiceRef.name
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-inbound-latency
+  namespace: demo
+spec:
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      -
+        name: inbound-latency
+        direction: INBOUND
+        type: HTTP_LATENCY
+        percent: 10
+        http:
+          virtualServiceRef:
+            name: ""
+          routes:
+            -
+              match:
+                uriPrefix: /
+          delay:
+            fixedDelaySeconds: 2

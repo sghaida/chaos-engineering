@@ -43,7 +43,7 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd:allowDangerousTypes=true webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -248,3 +248,20 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+##@ Development
+
+ADMISSION_POLICY_DIR ?= test/admission-policy
+ADMISSION_NS ?= demo
+ADMISSION_MODE ?= dry-run
+ADMISSION_FAIL_FAST ?= 1
+
+.PHONY: admission-control-test
+admission-control-test: ## Run ValidatingAdmissionPolicy usecase suite (server-side dry-run by default)
+	@cd "$(ADMISSION_POLICY_DIR)" && \
+	FAIL_FAST="$(ADMISSION_FAIL_FAST)" NS="$(ADMISSION_NS)" MODE="$(ADMISSION_MODE)" ./run-tests.sh
+
+.PHONY: admission-control-sync
+admission-control-sync: ## Auto-sync DENY EXPECT_MSG_CONTAINS from live API server (APPEND=1 recommended)
+	@cd "$(ADMISSION_POLICY_DIR)" && \
+	NS="$(ADMISSION_NS)" APPEND="$${APPEND:-1}" ./sync-expectations.sh

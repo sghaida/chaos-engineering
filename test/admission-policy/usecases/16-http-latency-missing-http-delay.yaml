@@ -1,0 +1,29 @@
+# ------------------------------------------------------------------------------
+# EXPECT: DENY
+# EXPECT_MSG_CONTAINS: The faultinjections "fi-inbound-latency" is invalid: : ValidatingAdmissionPolicy 'faultinjection.chaos.sghaida.io' with binding 'faultinjection.chaos.sghaida.io' denied request: HTTP_LATENCY requires http.delay (and forb
+# NOTE: Scenario: HTTP_LATENCY missing http.delay
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-inbound-latency
+  namespace: demo
+spec:
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      -
+        name: inbound-latency
+        direction: INBOUND
+        type: HTTP_LATENCY
+        percent: 10
+        http:
+          virtualServiceRef:
+            name: httpbin
+          routes:
+            -
+              match:
+                uriPrefix: /

@@ -1,0 +1,42 @@
+# ------------------------------------------------------------------------------
+# EXPECT: DENY
+# EXPECT_MSG_CONTAINS: The faultinjections "fi-inbound-latency" is invalid: : ValidatingAdmissionPolicy 'faultinjection.chaos.sghaida.io' with binding 'faultinjection.chaos.sghaida.io' denied request: stopConditions.defaults must be provided (
+# NOTE: Scenario: Rule omits intervalSeconds but defaults.intervalSeconds missing
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-inbound-latency
+  namespace: demo
+spec:
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      -
+        name: inbound-latency
+        direction: INBOUND
+        type: HTTP_LATENCY
+        percent: 10
+        http:
+          virtualServiceRef:
+            name: httpbin
+          routes:
+            -
+              match:
+                uriPrefix: /
+          delay:
+            fixedDelaySeconds: 2
+  stopConditions:
+    defaults:
+      windowSeconds: 60
+      consecutiveBreaches: 2
+    rules:
+      -
+        name: error-rate
+        promql: sum(rate(http_requests_total{code=~"5.."}[1m]))
+        compare:
+          op: GT
+          threshold: 1.0

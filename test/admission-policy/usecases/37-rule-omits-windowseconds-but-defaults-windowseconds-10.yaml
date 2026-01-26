@@ -1,0 +1,43 @@
+# ------------------------------------------------------------------------------
+# EXPECT: DENY
+# EXPECT_MSG_CONTAINS: The FaultInjection "fi-inbound-latency" is invalid: spec.stopConditions.defaults.windowSeconds: Invalid value: 9: spec.stopConditions.defaults.windowSeconds in body should be greater than or equal to 10
+# NOTE: Scenario: Rule omits windowSeconds but defaults.windowSeconds < 10
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-inbound-latency
+  namespace: demo
+spec:
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      -
+        name: inbound-latency
+        direction: INBOUND
+        type: HTTP_LATENCY
+        percent: 10
+        http:
+          virtualServiceRef:
+            name: httpbin
+          routes:
+            -
+              match:
+                uriPrefix: /
+          delay:
+            fixedDelaySeconds: 2
+  stopConditions:
+    defaults:
+      intervalSeconds: 10
+      windowSeconds: 9
+      consecutiveBreaches: 2
+    rules:
+      -
+        name: error-rate
+        promql: sum(rate(http_requests_total{code=~"5.."}[1m]))
+        compare:
+          op: GT
+          threshold: 1.0

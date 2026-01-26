@@ -1,0 +1,30 @@
+# ------------------------------------------------------------------------------
+# EXPECT: DENY
+# EXPECT_MSG_CONTAINS: The FaultInjection "fi-inbound-latency" is invalid: spec.actions.meshFaults[0].http.routes[0].match: Invalid value: "null": spec.actions.meshFaults[0].http.routes[0].match in body must be of type object: "null"
+# NOTE: Scenario: Route match has neither uriPrefix nor uriExact
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-inbound-latency
+  namespace: demo
+spec:
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      -
+        name: inbound-latency
+        direction: INBOUND
+        type: HTTP_LATENCY
+        percent: 10
+        http:
+          virtualServiceRef:
+            name: httpbin
+          routes:
+            -
+              match:
+          delay:
+            fixedDelaySeconds: 2

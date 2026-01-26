@@ -1,0 +1,33 @@
+# ------------------------------------------------------------------------------
+# EXPECT: DENY
+# EXPECT_MSG_CONTAINS: The FaultInjection "fi-inbound-latency" is invalid: spec.stopConditions.rules: Invalid value: "null": spec.stopConditions.rules in body must be of type array: "null"
+# NOTE: Scenario: stopConditions.rules empty
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-inbound-latency
+  namespace: demo
+spec:
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      -
+        name: inbound-latency
+        direction: INBOUND
+        type: HTTP_LATENCY
+        percent: 10
+        http:
+          virtualServiceRef:
+            name: httpbin
+          routes:
+            -
+              match:
+                uriPrefix: /
+          delay:
+            fixedDelaySeconds: 2
+  stopConditions:
+    rules:

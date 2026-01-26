@@ -1,0 +1,33 @@
+# ------------------------------------------------------------------------------
+# EXPECT: ALLOW
+# NOTE: Baseline: minimal OUTBOUND abort (should pass 0..7)
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-outbound-abort
+  namespace: demo
+spec:
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      -
+        name: outbound-abort
+        direction: OUTBOUND
+        type: HTTP_ABORT
+        percent: 10
+        http:
+          destinationHosts:
+            - foo.default.svc.cluster.local
+          sourceSelector:
+            matchLabels:
+              app: caller
+          routes:
+            -
+              match:
+                uriExact: /api
+          abort:
+            httpStatus: 503

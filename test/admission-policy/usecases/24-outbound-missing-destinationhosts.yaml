@@ -1,0 +1,32 @@
+# ------------------------------------------------------------------------------
+# EXPECT: DENY
+# EXPECT_MSG_CONTAINS: The faultinjections "fi-outbound-abort" is invalid: : ValidatingAdmissionPolicy 'faultinjection.chaos.sghaida.io' with binding 'faultinjection.chaos.sghaida.io' denied request: INBOUND requires http.virtualServiceRef.nam
+# NOTE: Scenario: OUTBOUND missing destinationHosts
+# ------------------------------------------------------------------------------
+apiVersion: chaos.sghaida.io/v1alpha1
+kind: FaultInjection
+metadata:
+  name: fi-outbound-abort
+  namespace: demo
+spec:
+  blastRadius:
+    durationSeconds: 60
+    maxTrafficPercent: 10
+    scope: namespace
+  actions:
+    meshFaults:
+      -
+        name: outbound-abort
+        direction: OUTBOUND
+        type: HTTP_ABORT
+        percent: 10
+        http:
+          sourceSelector:
+            matchLabels:
+              app: caller
+          routes:
+            -
+              match:
+                uriExact: /api
+          abort:
+            httpStatus: 503

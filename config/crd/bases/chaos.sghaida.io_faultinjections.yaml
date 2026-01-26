@@ -57,6 +57,20 @@ spec:
                         - targets exactly one traffic direction (INBOUND or OUTBOUND)
                         - affects a bounded percentage of traffic
                         - is independently cleaned up by name
+                        - may define multiple HTTP route matches
+
+                        Note: when defining multiple MeshFaultActions within the same FaultInjection,
+                        ensure that their route matches do not overlap to avoid conflicting VirtualService rules.
+                        This is the operator's responsibility when defining faults.
+                        The controller MAY validate for overlapping matches and reject conflicting configurations.
+
+                        Note: when applying outbound faults with sourceSelector,
+                        the controller MUST ensure that the affected pods do not exceed blastRadius.maxPodsAffected.
+                        If the controller cannot safely estimate the number of affected pods,
+                        it MUST abort the experiment to avoid wide-impact chaos.
+
+                        Note: the controller MUST clean up any created or patched VirtualServices
+                        when the FaultInjection completes or is cancelled.
                       properties:
                         direction:
                           description: |-
@@ -77,7 +91,10 @@ spec:
                             abort:
                               description: |-
                                 Abort defines HTTP abort (error) injection.
-                                Required for HTTP_ABORT.
+
+                                Admission policy:
+                                - Required for HTTP_ABORT (cross-field invariant).
+                                - Must be omitted for HTTP_LATENCY (cross-field invariant).
                               properties:
                                 httpStatus:
                                   description: |-
@@ -93,7 +110,10 @@ spec:
                             delay:
                               description: |-
                                 Delay defines fixed latency injection.
-                                Required for HTTP_LATENCY.
+
+                                Admission policy:
+                                - Required for HTTP_LATENCY (cross-field invariant).
+                                - Must be omitted for HTTP_ABORT (cross-field invariant).
                               properties:
                                 fixedDelaySeconds:
                                   description: |-
@@ -109,10 +129,9 @@ spec:
                               description: |-
                                 DestinationHosts defines the destination hostnames for outbound faults.
 
-                                These are typically external domains (e.g. api.vendor.com) or
-                                internal service hostnames.
-
-                                Required when direction=OUTBOUND.
+                                Admission policy:
+                                - Required when direction=OUTBOUND (cross-field invariant).
+                                - Must be omitted when direction=INBOUND (cross-field invariant).
                               items:
                                 type: string
                               maxItems: 32
@@ -121,9 +140,14 @@ spec:
                               description: |-
                                 Routes define HTTP match conditions under which the fault applies.
                                 These routes are prepended before existing VirtualService rules.
+
+                                Admission policy:
+                                - Must have at least one entry (MinItems=1).
+                                - Each match must set at least one of uriPrefix or uriExact (cross-field invariant).
                               items:
-                                description: HTTPRouteTarget defines a single HTTP
-                                  routing match.
+                                description: |-
+                                  HTTPRouteTarget defines a single HTTP routing match.
+                                  Multiple targets may be specified per fault action.
                                 properties:
                                   match:
                                     description: Match defines how incoming requests
@@ -158,13 +182,14 @@ spec:
                                 SourceSelector restricts OUTBOUND faults to traffic originating
                                 from workloads matching these labels.
 
-                                Strongly recommended to avoid impacting all mesh workloads.
+                                Admission policy:
+                                - Strongly recommended for safety; required if blastRadius.maxPodsAffected is set
+                                  (cross-field invariant enforced by controller/webhook).
                               properties:
                                 matchLabels:
                                   additionalProperties:
                                     type: string
-                                  description: |-
-                                    MatchLabels restricts matching to workloads
+                                  description: MatchLabels restricts matching to workloads
                                     that have all of the specified labels.
                                   minProperties: 1
                                   type: object
@@ -175,10 +200,10 @@ spec:
                               description: |-
                                 Timeout defines an HTTP route timeout.
 
-                                Note:
-                                Istio timeouts are not percentage-based.
-                                To simulate percentage-based timeouts, configure:
-                                  delay.fixedDelaySeconds > timeout.timeoutSeconds
+                                Admission policy:
+                                - Optional for both types.
+                                - If set, delay.fixedDelaySeconds MUST be greater than timeout.timeoutSeconds
+                                  to simulate percentage-based timeouts (cross-field invariant).
                               properties:
                                 timeoutSeconds:
                                   description: |-
@@ -194,8 +219,9 @@ spec:
                               description: |-
                                 VirtualServiceRef references an existing VirtualService to patch.
 
-                                Required when direction=INBOUND.
-                                Optional when direction=OUTBOUND.
+                                Admission policy:
+                                - Required when direction=INBOUND (cross-field invariant).
+                                - Optional when direction=OUTBOUND.
                               properties:
                                 name:
                                   description: Name of the VirtualService.
@@ -218,10 +244,11 @@ spec:
                           type: string
                         percent:
                           description: |-
-                            Percent defines the percentage of matching traffic
-                            affected by this fault.
+                            Percent defines the percentage of matching traffic affected by this fault.
 
-                            This value MUST be <= blastRadius.maxTrafficPercent.
+                            Admission policy:
+                            - Must be 0..100 (Maximum/Minimum).
+                            - Must be <= blastRadius.maxTrafficPercent (cross-field invariant; admission webhook/controller validation).
                           format: int32
                           maximum: 100
                           minimum: 0
@@ -294,6 +321,260 @@ spec:
                 - durationSeconds
                 - maxTrafficPercent
                 type: object
+              cancel:
+                description: |-
+                  Cancel requests immediate stop + cleanup.
+                  This is the external stop mechanism for GitOps workflows (e.g., Argo patch).
+                  Admission policy: none (boolean toggle).
+                type: boolean
+              stopConditions:
+                description: |-
+                  StopConditions define automatic kill-switch rules.
+
+                  Admission policy (cross-field invariants):
+                  - If stopConditions is set, rules MUST be non-empty (enforced by MinItems=1 on Rules).
+                  - If stopConditions.rules has at least one entry, failOnNoMetrics MUST default to true
+                    unless explicitly set to false by the user (defaulting webhook).
+                  - Exactly one of rule.promql or rule.structured MUST be set for every rule.
+                  - If any rule omits intervalSeconds or windowSeconds, defaults MUST be provided and must
+                    supply the missing values.
+                  - If overallBreachesCount is set, consecutiveBreaches MUST NOT be present anywhere
+                    (neither defaults.consecutiveBreaches nor any rule.consecutiveBreaches).
+                  - If overallBreachesCount is NOT set, consecutiveBreaches MUST be defined either
+                    in defaults OR on ALL rules; otherwise admission MUST reject.
+                properties:
+                  defaults:
+                    description: |-
+                      Defaults defines optional per-experiment defaults for rule evaluation.
+
+                      Admission policy:
+                      - Required if any rule omits intervalSeconds or windowSeconds.
+                      - In per-rule mode (overallBreachesCount unset), required unless every rule specifies
+                        consecutiveBreaches explicitly.
+                      - In overall mode (overallBreachesCount set), defaults.consecutiveBreaches MUST NOT be set.
+                    properties:
+                      consecutiveBreaches:
+                        description: |-
+                          ConsecutiveBreaches is the default debounce count before triggering a stop.
+
+                          Admission policy:
+                          - In per-rule mode (overallBreachesCount unset), required unless all rules set their own
+                            consecutiveBreaches explicitly.
+                          - In overall mode (overallBreachesCount set), MUST NOT be present.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      intervalSeconds:
+                        description: IntervalSeconds is how often rules are evaluated
+                          by default.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      windowSeconds:
+                        description: WindowSeconds is the lookback window for rate/count
+                          computations.
+                        format: int32
+                        minimum: 10
+                        type: integer
+                    type: object
+                  failOnNoMetrics:
+                    description: |-
+                      FailOnNoMetrics controls whether missing/invalid metrics should trigger the kill switch.
+
+                      Defaulting policy:
+                      - If rules has at least one entry, this MUST default to true unless explicitly set.
+                        (Implement via a defaulter webhook; pointer form allows distinguishing unset vs false.)
+                    type: boolean
+                  overallBreachesCount:
+                    description: |-
+                      OverallBreachesCount enables "overall" stop mode.
+
+                      Admission policy:
+                      - If set, consecutiveBreaches MUST NOT be present anywhere (defaults or rules).
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  rules:
+                    description: |-
+                      Rules is the set of kill-switch rules.
+                      At least one rule must be provided when stopConditions is set.
+                    items:
+                      description: |-
+                        StopRule defines one kill-switch rule.
+
+                        Rules can be expressed either as:
+                        - promql: raw PromQL string (escape hatch), OR
+                        - structured: a structured query definition (metric/type/method/labels)
+
+                        Exactly ONE of promql or structured MUST be set (enforced by controller or webhook).
+
+                        Evaluation semantics:
+                          - The rule is evaluated only when it becomes "due" (based on intervalSeconds).
+                          - If the query yields multiple time series (e.g. groupBy=["pod"]), the controller
+                            treats the rule as breached if ANY series breaches the threshold (safer default).
+
+                        Admission policy (cross-field invariants):
+                          - Exactly one of promql or structured must be set.
+                          - If overallBreachesCount is set, consecutiveBreaches MUST NOT be set on any rule.
+                          - If overallBreachesCount is NOT set, consecutiveBreaches MUST be defined either
+                            in defaults OR on ALL rules.
+                      properties:
+                        compare:
+                          description: Compare defines how the observed value is compared
+                            against the threshold.
+                          properties:
+                            op:
+                              description: Op defines the comparison operator.
+                              enum:
+                              - GT
+                              - GTE
+                              - LT
+                              - LTE
+                              - EQ
+                              - NEQ
+                              type: string
+                            threshold:
+                              description: Threshold is the numeric threshold to compare
+                                against.
+                              type: number
+                          required:
+                          - op
+                          - threshold
+                          type: object
+                        consecutiveBreaches:
+                          description: |-
+                            ConsecutiveBreaches overrides the default debounce count for this rule.
+
+                            Admission policy:
+                            - If overallBreachesCount is set, MUST NOT be present.
+                            - If overallBreachesCount is NOT set, must be resolvable either by setting this field
+                              on ALL rules or by setting defaults.consecutiveBreaches.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        intervalSeconds:
+                          description: |-
+                            IntervalSeconds overrides the default interval for this rule.
+
+                            Admission policy:
+                            - If omitted, defaults.intervalSeconds must be set.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        name:
+                          description: Name is a stable identifier for this rule,
+                            used for status reporting.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        promql:
+                          description: |-
+                            PromQL is a raw Prometheus query to evaluate (escape hatch).
+
+                            Admission policy:
+                            - Exactly one of promql or structured must be set.
+                          type: string
+                        structured:
+                          description: |-
+                            Structured defines a safe, label-agnostic query builder.
+
+                            Admission policy:
+                            - Exactly one of promql or structured must be set.
+                          properties:
+                            match:
+                              description: Match scopes the query to specific label
+                                sets and optional group-by dimensions.
+                              properties:
+                                groupBy:
+                                  description: GroupBy lists label keys to group results
+                                    by (e.g., ["pod"]).
+                                  items:
+                                    type: string
+                                  type: array
+                                labels:
+                                  additionalProperties:
+                                    type: string
+                                  description: |-
+                                    Labels is a set of dynamic label matchers (exact or regex).
+                                    At least one label SHOULD be provided to avoid cluster-wide queries.
+                                  type: object
+                              type: object
+                            metric:
+                              description: Metric identifies the metric name and type.
+                              properties:
+                                name:
+                                  description: Name is the Prometheus metric name
+                                    to query.
+                                  minLength: 1
+                                  type: string
+                                type:
+                                  description: Type declares how the metric should
+                                    be interpreted.
+                                  enum:
+                                  - counter
+                                  - histogram
+                                  - summary
+                                  type: string
+                              required:
+                              - name
+                              - type
+                              type: object
+                            query:
+                              description: Query defines how to compute a value from
+                                the metric over a lookback window.
+                              properties:
+                                aggregation:
+                                  description: |-
+                                    Aggregation determines how to aggregate series before comparison.
+                                    If groupBy is set, aggregation is applied "by (groupBy...)".
+                                    Defaults to "sum" for counters and "sum" for histogram buckets.
+                                  enum:
+                                  - sum
+                                  - avg
+                                  - max
+                                  - min
+                                  type: string
+                                kind:
+                                  description: Kind selects the computation method.
+                                  enum:
+                                  - rate
+                                  - count
+                                  - quantile
+                                  type: string
+                                quantile:
+                                  description: |-
+                                    Quantile is required when kind=quantile.
+                                    For histograms, this maps to histogram_quantile(q, ...).
+                                    For summaries, this maps to selecting quantile-labeled series.
+                                  maximum: 1
+                                  minimum: 0
+                                  type: number
+                              required:
+                              - kind
+                              type: object
+                          required:
+                          - match
+                          - metric
+                          - query
+                          type: object
+                        windowSeconds:
+                          description: |-
+                            WindowSeconds overrides the default lookback window for this rule.
+
+                            Admission policy:
+                            - If omitted, defaults.windowSeconds must be set.
+                          format: int32
+                          minimum: 10
+                          type: integer
+                      required:
+                      - compare
+                      - name
+                      type: object
+                    minItems: 1
+                    type: array
+                required:
+                - rules
+                type: object
             required:
             - actions
             - blastRadius
@@ -301,6 +582,12 @@ spec:
           status:
             description: Status reflects the observed state of the FaultInjection.
             properties:
+              cancelledAt:
+                description: |-
+                  CancelledAt is set when the experiment is stopped externally (spec.cancel)
+                  or automatically (stopConditions).
+                format: date-time
+                type: string
               expiresAt:
                 description: ExpiresAt is the timestamp when the experiment is scheduled
                   to end.
@@ -318,16 +605,67 @@ spec:
                   - Running
                   - Completed
                   - Error
+                  - Cancelled
                 enum:
                 - Pending
                 - Running
                 - Completed
                 - Error
+                - Cancelled
                 type: string
+              rules:
+                description: Rules captures per-rule evaluation state (interval scheduling
+                  + debouncing).
+                items:
+                  description: |-
+                    StopRuleStatus stores per-rule evaluation state.
+
+                    This allows the controller to:
+                    - evaluate only "due" rules (per-rule dynamic intervals)
+                    - report the last observed value for debugging
+                    - report the last PromQL used (built or raw) for debugging
+                    - report the last evaluation outcome (breached/ok/error/no-data)
+
+                    Note: breach counters are still useful for debugging even if you run in overall mode.
+                  properties:
+                    breachCount:
+                      description: |-
+                        BreachCount tracks consecutive breaches for this rule (per-rule mode),
+                        or how many times this rule breached (overall mode) for debugging.
+                      format: int32
+                      type: integer
+                    lastEvaluatedAt:
+                      description: LastEvaluatedAt records when this rule was last
+                        evaluated.
+                      format: date-time
+                      type: string
+                    lastObserved:
+                      description: LastObserved is the last observed value for this
+                        rule (scalar or max over vector).
+                      type: number
+                    lastQuery:
+                      description: LastQuery is the last PromQL used (built or raw)
+                        for this rule, for debugging.
+                      type: string
+                    message:
+                      description: Message contains the last evaluation outcome (breached/ok/error/no-data).
+                      type: string
+                    name:
+                      description: Name matches StopRule.name.
+                      minLength: 1
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
               startedAt:
                 description: StartedAt is the timestamp when the experiment actually
                   began.
                 format: date-time
+                type: string
+              stopReason:
+                description: StopReason indicates why the experiment was stopped (external
+                  or which rule).
                 type: string
             type: object
         required:
