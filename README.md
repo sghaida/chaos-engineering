@@ -18,6 +18,15 @@
     - [Directions](#directions)
     - [Targeting](#targeting)
   - [📄 Example: INBOUND fault](#-example-inbound-fault)
+  - [🛑 Cancellation (stop immediately)](#-cancellation-stop-immediately)
+    - [Cancel with kubectl](#cancel-with-kubectl)
+      - [Merge patch (recommended)](#merge-patch-recommended)
+      - [JSON patch](#json-patch)
+    - [Cancel with Argo CD (GitOps)](#cancel-with-argo-cd-gitops)
+      - [Approach A (recommended): commit `spec.cancel: true` and sync](#approach-a-recommended-commit-speccancel-true-and-sync)
+      - [Approach B: patch live (no git commit)](#approach-b-patch-live-no-git-commit)
+    - [What happens on cancel](#what-happens-on-cancel)
+    - [Admission policy behavior](#admission-policy-behavior)
   - [🔐 Security Model](#-security-model)
     - [1️⃣ RBAC model](#1️⃣-rbac-model)
       - [Principle: *Teams own chaos in their namespace only*](#principle-teams-own-chaos-in-their-namespace-only)
@@ -56,6 +65,7 @@
     - [11) Testing](#11-testing)
     - [12) Cleanup](#12-cleanup)
       - [Remove the experiment](#remove-the-experiment)
+      - [Cancel the experiment](#cancel-the-experiment)
       - [Remove operator](#remove-operator)
       - [Remove admission policy](#remove-admission-policy)
       - [Remove CRDs](#remove-crds)
@@ -64,6 +74,7 @@
       - [Optional: stop/delete the Lima VM](#optional-stopdelete-the-lima-vm)
     - [Troubleshooting](#troubleshooting)
       - [Admission policy rejects your FaultInjection](#admission-policy-rejects-your-faultinjection)
+      - [Cancellation not taking effect](#cancellation-not-taking-effect)
       - [Outbound faults not applying](#outbound-faults-not-applying)
   - [how to run on k8s cluster](#how-to-run-on-k8s-cluster)
     - [0) Prereqs (cluster)](#0-prereqs-cluster)
@@ -94,8 +105,6 @@ A **GitOps-first chaos engineering system** for Kubernetes that enables **determ
 
 > Built for **shared clusters**, **auditable chaos**, and **production-faithful testing** — without packet-level hacks, agents, or privileged access.
 
----
-
 ## ✨ What is this?
 
 **Network Fault Injector** lets teams declare controlled failure scenarios as Kubernetes resources:
@@ -104,6 +113,7 @@ A **GitOps-first chaos engineering system** for Kubernetes that enables **determ
 - Deterministic “timeouts” (HTTP aborts)
 - Inbound *and* outbound traffic targeting
 - Strict blast-radius and semantic validation
+- External cancellation (kill switch) via `spec.cancel=true`
 
 Everything is expressed via a custom:
 
@@ -113,16 +123,14 @@ FaultInjection (CRD)
 
 …and enforced **before execution** using **CEL-based `ValidatingAdmissionPolicy`**.
 
----
-
 ## 🔑 Why this exists
 
 Traditional chaos tooling often suffers from one or more of:
 
-- Non-determinism (iptables, netem, tc)
-- Unsafe primitives in shared clusters
-- High operational overhead (agents, privileges)
-- Poor auditability
+* Non-determinism (iptables, netem, tc)
+* Unsafe primitives in shared clusters
+* High operational overhead (agents, privileges)
+* Poor auditability
 
 This project takes a **policy-first, request-level** approach.
 
@@ -148,8 +156,6 @@ flowchart LR
     Ctrl -->|reconcile| VS[Istio VirtualService]
     VS --> Envoy[Envoy Sidecar]
 ```
-
----
 
 ### Runtime execution
 
@@ -177,23 +183,21 @@ sequenceDiagram
 
 ## 🚦 Supported faults
 
-- `HTTP_LATENCY` – fixed delay
-- `HTTP_ABORT` – deterministic abort (e.g. 504)
+* `HTTP_LATENCY` – fixed delay
+* `HTTP_ABORT` – deterministic abort (e.g. 504)
 
 ### Directions
 
-- **INBOUND**: client → service
-- **OUTBOUND**: pod → destination (`gateways: ["mesh"]`)
+* **INBOUND**: client → service
+* **OUTBOUND**: pod → destination (`gateways: ["mesh"]`)
 
 ### Targeting
 
-- URI prefix / exact
-- Optional headers
-- Source pod labels (outbound)
-- Destination hosts
-- Percentage-based traffic
-
----
+* URI prefix / exact
+* Optional headers
+* Source pod labels (outbound)
+* Destination hosts
+* Percentage-based traffic
 
 ## 📄 Example: INBOUND fault
 
@@ -210,13 +214,135 @@ spec:
     meshFaults:
       - name: delay-orders
         direction: INBOUND
-        virtualServiceRef:
-          name: orders
-        uriPrefix: /api/orders
-        delay:
-          fixedDelay: 2s
-        percentage: 30
+        type: HTTP_LATENCY
+        percent: 30
+        http:
+          virtualServiceRef:
+            name: orders
+          routes:
+            - match:
+                uriPrefix: /api/orders
+          delay:
+            fixedDelaySeconds: 2
 ```
+
+---
+
+## 🛑 Cancellation (stop immediately)
+
+Chaos is GitOps-friendly, but “stop now” needs a first-class mechanism.
+
+This project supports **external cancellation** by toggling:
+
+```yaml
+spec:
+  cancel: true
+```
+
+Once `spec.cancel=true` is observed, the controller performs **immediate cleanup** (same cleanup path as expiry), and updates status:
+
+* `status.phase = "Cancelled"`
+* `status.message = "Cancelled: cleaned up injected rules"`
+* `status.cancelledAt = now`
+* `status.stopReason = "external: spec.cancel=true"`
+
+### Cancel with kubectl
+
+#### Merge patch (recommended)
+
+```bash
+kubectl -n demo patch faultinjection fi-inbound-outbound-latency-timeout \
+  --type=merge \
+  -p '{"spec":{"cancel":true}}'
+```
+
+#### JSON patch
+
+```bash
+kubectl -n demo patch faultinjection fi-inbound-outbound-latency-timeout \
+  --type=json \
+  -p='[{"op":"add","path":"/spec/cancel","value":true}]'
+```
+
+Verify:
+
+```bash
+kubectl -n demo get faultinjection fi-inbound-outbound-latency-timeout -o yaml | sed -n '/status:/,$p'
+```
+
+Expected (example):
+
+```yaml
+status:
+  phase: Cancelled
+  message: "Cancelled: cleaned up injected rules"
+  cancelledAt: "..."
+  stopReason: "external: spec.cancel=true"
+```
+
+### Cancel with Argo CD (GitOps)
+
+Two common GitOps approaches:
+
+#### Approach A (recommended): commit `spec.cancel: true` and sync
+
+1. Update the manifest in git:
+
+```yaml
+spec:
+  cancel: true
+```
+
+2. Sync the app:
+
+```bash
+argocd app sync <app-name>
+```
+
+✅ Pros:
+
+* Fully auditable (PR history shows who cancelled)
+* Works in any cluster without special Argo features
+
+⚠️ Note:
+
+* If you want to run the experiment again, set `spec.cancel=false` (or remove it) and apply a fresh experiment (often with a new name).
+
+#### Approach B: patch live (no git commit)
+
+If you want a one-off cancel without committing to git:
+
+```bash
+kubectl -n demo patch faultinjection fi-inbound-outbound-latency-timeout \
+  --type=merge \
+  -p '{"spec":{"cancel":true}}'
+```
+
+⚠️ Argo will reconcile back to the git value on next sync unless:
+
+* the repo also includes `cancel: true`, **or**
+* you configure Argo `ignoreDifferences` for `spec.cancel`.
+
+### What happens on cancel
+
+Cancellation is designed to be safe and deterministic:
+
+* The controller removes injected VirtualService rules immediately.
+* If the controller created any helper resources for the experiment (e.g. a fault Deployment), it cleans those up as part of cancellation as well.
+* Status is set to **Cancelled** with `cancelledAt` and `stopReason`.
+
+### Admission policy behavior
+
+Cancellation is intended to be a **kill switch**.
+
+The admission policy should allow setting `spec.cancel=true` even if the rest of the spec would normally be rejected by policy-level invariants.
+
+Important nuance:
+
+* **CRD schema validation still applies.**
+
+  * Cancellation does **not** bypass CRD schema requirements (min/max, required fields, minItems, etc).
+* The “cancel bypass” only applies to **admission policy (CEL) validations**.
 
 ---
 
@@ -250,9 +376,9 @@ Bound via `RoleBinding` to app teams.
 
 🚫 App teams **cannot**:
 
-- Modify admission policies
-- Touch other namespaces
-- Modify VirtualServices directly (optional)
+* Modify admission policies
+* Touch other namespaces
+* Modify VirtualServices directly (optional)
 
 ---
 
@@ -262,14 +388,19 @@ Even cluster-admins are constrained unless policies are removed.
 
 Enforced at CREATE / UPDATE:
 
-- Required blast radius
-- Max duration / percentage
-- Semantic correctness
-- Mandatory selectors
-- Direction correctness
-- No unsafe routing
+* Required blast radius
+* Max duration / percentage
+* Semantic correctness
+* Mandatory selectors
+* Direction correctness
+* No unsafe routing
 
 If rejected → **experiment never runs**.
+
+✅ Cancellation is a special case (kill switch):
+
+* `spec.cancel=true` should be allowed to pass policy-level validations to stop experiments immediately.
+* CRD schema validation still applies (structural validation cannot be bypassed).
 
 ---
 
@@ -292,13 +423,13 @@ If rejected → **experiment never runs**.
 
 RBAC:
 
-- Namespace-scoped create/update/delete
+* Namespace-scoped create/update/delete
 
 Admission:
 
-- Max delay: 5s
-- Max traffic: 100%
-- Max duration: 30m
+* Max delay: 5s
+* Max traffic: 100%
+* Max duration: 30m
 
 ```yaml
 spec.blastRadius.durationSeconds <= 1800
@@ -312,14 +443,14 @@ spec.blastRadius.durationSeconds <= 1800
 
 RBAC:
 
-- Namespace-scoped
-- Requires team approval
+* Namespace-scoped
+* Requires team approval
 
 Admission:
 
-- Max delay: 3s
-- Max traffic: 50%
-- Max duration: 15m
+* Max delay: 3s
+* Max traffic: 50%
+* Max duration: 15m
 
 Optional:
 
@@ -335,14 +466,14 @@ metadata.annotations["chaos.reviewed"] == "true"
 
 RBAC:
 
-- Read/write only for approved groups
+* Read/write only for approved groups
 
 Admission:
 
-- Max delay: 2s
-- Max traffic: 30%
-- Max duration: 10m
-- Required approval annotation
+* Max delay: 2s
+* Max traffic: 30%
+* Max duration: 10m
+* Required approval annotation
 
 ```yaml
 metadata.annotations["chaos.approved-by"].exists()
@@ -388,9 +519,9 @@ Frame as **controlled failure injection**, not “breaking prod”.
 
 Platform team owns:
 
-- CRDs
-- Admission policies
-- Controller lifecycle
+* CRDs
+* Admission policies
+* Controller lifecycle
 
 ---
 
@@ -427,9 +558,9 @@ Short duration, low percentage, approval required.
 
 ### Phase 6 — Normalize chaos
 
-- Replay incidents
-- Validate SLOs
-- Test before launches
+* Replay incidents
+* Validate SLOs
+* Test before launches
 
 > “If you can’t describe how it fails, you can’t ship it.”
 
@@ -445,11 +576,9 @@ brew install lima kubectl istioctl make docker
 
 This README uses:
 
-- **Lima** (VM)
-- **k3s** (Kubernetes)
-- **Istio** (Envoy data plane)
-
----
+* **Lima** (VM)
+* **k3s** (Kubernetes)
+* **Istio** (Envoy data plane)
 
 ### 1) Start k3s via Lima
 
@@ -466,8 +595,6 @@ kubectl get nodes
 
 Expected: node is `Ready`.
 
----
-
 ### 2) Disable Traefik (no restart)
 
 k3s installs Traefik via a HelmChart CRD. Remove it safely at runtime:
@@ -477,8 +604,6 @@ kubectl -n kube-system delete helmchart traefik traefik-crd --ignore-not-found
 kubectl get pods -n kube-system | grep traefik || echo "Traefik removed"
 ```
 
----
-
 ### 3) Install Istio
 
 ```bash
@@ -486,16 +611,12 @@ istioctl install -y --set profile=default
 kubectl get pods -n istio-system
 ```
 
----
-
 ### 4) Create demo namespace and enable sidecar injection
 
 ```bash
 kubectl create namespace demo --dry-run=client -o yaml | kubectl apply -f -
 kubectl label namespace demo istio-injection=enabled --overwrite
 ```
-
----
 
 ### 5) Deploy demo apps (httpbin1, httpbin2, curl-client)
 
@@ -513,8 +634,6 @@ kubectl -n demo rollout status deploy/httpbin2
 kubectl -n demo get pod curl-client
 ```
 
----
-
 ### 6) Apply VirtualServices
 
 Apply the VirtualServices that define the routing buckets used by the chaos rules:
@@ -525,8 +644,8 @@ kubectl apply -n demo -f resources/vs.yaml
 
 Notes:
 
-- **INBOUND** uses `VirtualService httpbin1`
-- **OUTBOUND** uses a single `VirtualService httpbin2` with `gateways: ["mesh"]`
+* **INBOUND** uses `VirtualService httpbin1`
+* **OUTBOUND** uses a single `VirtualService httpbin2` with `gateways: ["mesh"]`
   to avoid non-deterministic merge ordering when multiple VirtualServices target the same host.
 
 Verify:
@@ -536,8 +655,6 @@ kubectl -n demo get virtualservice
 kubectl -n demo describe virtualservice httpbin2 | sed -n '1,120p'
 ```
 
----
-
 ### 7) Install CRDs
 
 Install the custom FaultInjection CRD:
@@ -546,8 +663,6 @@ Install the custom FaultInjection CRD:
 kubectl apply -f config/crd/bases/chaos.sghaida.io_faultinjections.yaml
 kubectl get crds | grep -i faultinjection
 ```
-
----
 
 ### 8) Install Admission Control (ValidatingAdmissionPolicy)
 
@@ -563,21 +678,24 @@ kubectl get validatingadmissionpolicybinding faultinjection.chaos.sghaida.io
 
 What it enforces (high-level):
 
-- Required `spec.blastRadius` + at least one `actions.meshFaults`
-- Unique action names
-- Percent bounds (`0..100`) and must not exceed `blastRadius.maxTrafficPercent`
-- Every route must have `uriPrefix` or `uriExact`
-- Type semantics:
+* Required `spec.blastRadius` + at least one `actions.meshFaults`
+* Unique action names
+* Percent bounds (`0..100`) and must not exceed `blastRadius.maxTrafficPercent`
+* Every route must have `uriPrefix` or `uriExact`
+* Type semantics:
 
-  - `HTTP_LATENCY` requires `delay` and forbids `abort`
-  - `HTTP_ABORT` requires `abort` and forbids `delay`
-- Direction semantics:
+  * `HTTP_LATENCY` requires `delay` and forbids `abort`
+  * `HTTP_ABORT` requires `abort` and forbids `delay`
+* Direction semantics:
 
-  - `INBOUND` requires `virtualServiceRef.name` and forbids `destinationHosts` and `sourceSelector`
-  - `OUTBOUND` requires `destinationHosts` and `sourceSelector.matchLabels`, forbids `virtualServiceRef`
-- Delay/timeout bounds capped at 300s (5m) unless updated
+  * `INBOUND` requires `virtualServiceRef.name` and forbids `destinationHosts` and `sourceSelector`
+  * `OUTBOUND` requires `destinationHosts` and `sourceSelector.matchLabels`, forbids `virtualServiceRef`
+* Delay/timeout bounds capped at 300s (5m) unless updated
+* StopConditions invariants (if enabled)
 
----
+Cancellation note:
+
+* The policy is expected to treat `spec.cancel=true` as a kill-switch and short-circuit policy-level validations.
 
 ### 9) Build and deploy the operator (local dev image)
 
@@ -612,8 +730,6 @@ kubectl get pods -A | grep -E "fi-operator|fault|chaos" || true
 > Namespace depends on your deployment manifests (commonly `chaos-system`).
 > Use `kubectl get pods -A | grep fi-operator` to locate it.
 
----
-
 ### 10) Apply the fault scenario
 
 Apply your `FaultInjection` manifest:
@@ -624,29 +740,15 @@ kubectl -n demo get faultinjection
 kubectl -n demo describe faultinjection fi-inbound-outbound-latency-timeout
 ```
 
-Scenario overview:
-
-- INBOUND latency on `/anything/vendors/` for `httpbin1`
-- INBOUND abort (504) when header `x-chaos-mode: timeout` for `httpbin1`
-- OUTBOUND latency on `/anything/vendors/` from pods labeled `app=curl-client` to host `httpbin2`
-- OUTBOUND abort (504) when header `x-chaos-mode: timeout` for the same source/destination
-
-Blast radius:
-
-- Duration: `600s`
-- Max traffic: `100%`
-
----
-
 ### 11) Testing
 
 Run the full test suite from the `curl-client` pod.
 This asserts:
 
-- control paths are fast (no fault)
-- abort paths return **504**
-- delay paths take **~2s**
-- non-matching paths remain fast
+* control paths are fast (no fault)
+* abort paths return **504**
+* delay paths take **~2s**
+* non-matching paths remain fast
 
 ```bash
 kubectl -n demo exec curl-client -- sh -lc '
@@ -725,14 +827,22 @@ echo "✅ ALL TESTS PASSED"
 '
 ```
 
----
-
 ### 12) Cleanup
 
 #### Remove the experiment
 
 ```bash
 kubectl -n demo delete faultinjection fi-inbound-outbound-latency-timeout --ignore-not-found
+```
+
+#### Cancel the experiment
+
+If you want to stop immediately but keep the CR around:
+
+```bash
+kubectl -n demo patch faultinjection fi-inbound-outbound-latency-timeout \
+  --type=merge \
+  -p '{"spec":{"cancel":true}}'
 ```
 
 #### Remove operator
@@ -750,7 +860,7 @@ kubectl delete -f resources/validating-policy.yaml --ignore-not-found
 #### Remove CRDs
 
 ```bash
-kubectl delete -f config/crd/bases/validating-policy.yaml --ignore-not-found
+kubectl delete -f config/crd/bases/chaos.sghaida.io_faultinjections.yaml --ignore-not-found
 ```
 
 #### Remove demo apps
@@ -787,13 +897,43 @@ kubectl apply -f resources/fi-scenarios.yaml --dry-run=server
 
 The error message will come from `ValidatingAdmissionPolicy` and should point to the violated rule.
 
+#### Cancellation not taking effect
+
+If a cancellation patch is denied or has no effect:
+
+1. Confirm the CRD includes `spec.cancel`:
+
+```bash
+kubectl get crd faultinjections.chaos.sghaida.io -o yaml | grep -n "cancel" | head
+```
+
+2. Confirm the installed ValidatingAdmissionPolicy includes the cancel short-circuit:
+
+```bash
+kubectl get validatingadmissionpolicy faultinjection.chaos.sghaida.io -o yaml | grep -n "spec.cancel" | head
+```
+
+If this prints nothing, you are still running the old policy.
+
+3. Re-apply the updated policy if needed:
+
+```bash
+kubectl apply -f resources/validating-policy.yaml
+```
+
+4. Confirm the controller is running and reconciling:
+
+```bash
+kubectl get pods -A | grep -E "fi-operator|chaos" || true
+```
+
 #### Outbound faults not applying
 
 Common causes:
 
-- `httpbin2` VirtualService missing `gateways: ["mesh"]`
-- Outbound rules split across multiple VirtualServices (merge ordering issues)
-- Source pod missing labels required by `sourceSelector.matchLabels`
+* `httpbin2` VirtualService missing `gateways: ["mesh"]`
+* Outbound rules split across multiple VirtualServices (merge ordering issues)
+* Source pod missing labels required by `sourceSelector.matchLabels`
 
 Verify curl-client labels:
 
@@ -807,26 +947,24 @@ Verify outbound VirtualService is in effect:
 kubectl -n demo get virtualservice httpbin2 -o yaml | sed -n '1,200p'
 ```
 
+---
+
 ## how to run on k8s cluster
 
 Here’s the **clean “deploy on a real cluster”** path (non-local, registry image). I’ll include both **raw YAML/kustomize** and **bundle** options, plus the **minimum Istio + policy** prerequisites.
 
----
-
 ### 0) Prereqs (cluster)
 
-- Kubernetes v1.27+ (or any version that supports `ValidatingAdmissionPolicy`)
-- Istio installed in the cluster (Envoy sidecars running)
-- `kubectl`, `make`, `docker`
-- A container registry your cluster can pull from
+* Kubernetes v1.27+ (or any version that supports `ValidatingAdmissionPolicy`)
+* Istio installed in the cluster (Envoy sidecars running)
+* `kubectl`, `make`, `docker`
+* A container registry your cluster can pull from
 
 > If you don’t have Istio yet: install it first.
 
 ```bash
 istioctl install -y --set profile=default
 ```
-
----
 
 ### Option A (recommended): Build, push, install CRDs, deploy controller
 
@@ -870,8 +1008,6 @@ Verify it’s running:
 kubectl get pods -A | grep -E "fi-operator|chaos" || true
 ```
 
----
-
 ### Option B: Install from the generated YAML bundle (dist/install.yaml)
 
 ### 1) Build the installer bundle
@@ -898,8 +1034,6 @@ kubectl get crd | grep -i faultinjection
 
 > This is the easiest “single file” install method for other teams.
 
----
-
 ### Option C: Deploy from manifests (kustomize)
 
 If your repo has the standard kubebuilder layout, you can:
@@ -910,8 +1044,6 @@ kustomize build config/default | kubectl apply -f -
 ```
 
 Or (often preferred) patch the image in `kustomization.yaml` and apply.
-
----
 
 ### After install: enable a target namespace
 
@@ -941,6 +1073,12 @@ Dry-run admission check (very useful in CI):
 kubectl -n <ns> apply -f <your-fi.yaml> --dry-run=server
 ```
 
+Cancellation (kill switch):
+
+```bash
+kubectl -n <ns> patch faultinjection <name> --type=merge -p '{"spec":{"cancel":true}}'
+```
+
 ---
 
 #### Troubleshooting quick checks
@@ -964,6 +1102,8 @@ kubectl -n <ns> apply -f <your-fi.yaml> --dry-run=server
 kubectl -n <ns> get pods
 kubectl -n <ns> describe pod <pod> | grep -i istio-proxy
 ```
+
+---
 
 ## 📜 License
 
