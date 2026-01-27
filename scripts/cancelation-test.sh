@@ -118,28 +118,6 @@ wait_cleanup_gone() {
   fail "Timed out waiting for cleanup to finish"
 }
 
-assert_eventually_ge() {
-  name="$1"; min="$2"; cmd="$3"; timeout="$4"
-  start="$(date +%s)"
-
-  while true; do
-    out="$(in_pod "$cmd")"
-    printf "%s\n" "$out"
-    total="$(printf "%s" "$out" | sed -n 's/.*total=\([0-9.]*\).*/\1/p' | tail -n1)"
-
-    if awk -v t="$total" -v m="$min" 'BEGIN{ exit !(t>=m) }'; then
-      ok "$name (total=$total>=${min})"
-      return 0
-    fi
-
-    now="$(date +%s)"
-    if [ $((now-start)) -ge "$timeout" ]; then
-      fail "$name expected total>=${min} within ${timeout}s (last total=${total:-?})"
-    fi
-
-    sleep 0.2
-  done
-}
 
 echo "=== PRE-CANCEL (assert faults active) ==="
 
@@ -170,14 +148,10 @@ printf "%s\n" "$i1"
 assert_code "INBOUND CTRL" "200" "$i1"
 assert_lt   "INBOUND CTRL fast" "0.5" "$i1"
 
-# i2="$(in_pod "curl -s -o /dev/null -w \"INBOUND DELAY code=%{http_code} total=%{time_total}\\n\" http://httpbin1:8000/anything/vendors/test")"
-# printf "%s\n" "$i2"
-# assert_code "INBOUND DELAY" "200" "$i2"
-# assert_ge   "INBOUND DELAY >=2s" "1.8" "$i2"
-assert_eventually_ge \
-  "INBOUND DELAY >=2s" 1.8 \
-  'curl -s -o /dev/null -w "INBOUND DELAY code=%{http_code} total=%{time_total}\n" http://httpbin1:8000/anything/vendors/test' \
-  10
+i2="$(in_pod "curl -s -o /dev/null -w \"INBOUND DELAY code=%{http_code} total=%{time_total}\\n\" http://httpbin1:8000/anything/vendors/test")"
+printf "%s\n" "$i2"
+assert_code "INBOUND DELAY" "200" "$i2"
+assert_ge   "INBOUND DELAY >=2s" "1.8" "$i2"
 
 i3="$(in_pod "curl -s -o /dev/null -w \"INBOUND ABORT code=%{http_code} total=%{time_total}\\n\" -H \"x-chaos-mode: timeout\" http://httpbin1:8000/anything/test")"
 printf "%s\n" "$i3"

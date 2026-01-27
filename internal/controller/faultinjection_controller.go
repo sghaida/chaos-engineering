@@ -266,126 +266,72 @@ func (r *FaultInjectionReconciler) ensureLifecycle(
 ) (changed bool) {
 
 	now := time.Now().UTC()
+	durSeconds := fi.Spec.BlastRadius.DurationSeconds
 
-	log.V(1).Info("reconciling lifecycle",
+	log = log.WithValues(
 		"name", fi.Name,
 		"namespace", fi.Namespace,
-		"startedAt", fi.Status.StartedAt,
-		"expiresAt", fi.Status.ExpiresAt,
-		"durationSeconds", fi.Spec.BlastRadius.DurationSeconds,
+		"durationSeconds", durSeconds,
 	)
 
-	// ------------------------------------------------------------------
-	// StartedAt: initialize once
-	// ------------------------------------------------------------------
+	// Fail-closed guard (admission should prevent, but keep reconciler resilient).
+	if durSeconds <= 0 {
+		r.Recorder.Eventf(
+			fi, "Warning", "InvalidSpec",
+			"blastRadius.durationSeconds must be > 0 (got %d); lifecycle not initialized",
+			durSeconds,
+		)
+		log.Info("invalid durationSeconds; lifecycle not initialized", "durationSeconds", durSeconds)
+		return false
+	}
+
+	// Initialize StartedAt if missing.
 	if fi.Status.StartedAt == nil {
 		t := metav1.NewTime(now)
 		fi.Status.StartedAt = &t
 		changed = true
 
 		r.Recorder.Eventf(
-			fi,
-			"Normal",
-			"Started",
-			"Experiment started at %s (durationSeconds=%d, maxTrafficPercent=%d)",
-			t.Format(time.RFC3339),
-			fi.Spec.BlastRadius.DurationSeconds,
-			fi.Spec.BlastRadius.MaxTrafficPercent,
+			fi, "Normal", "Started",
+			"Experiment started; durationSeconds=%d maxTrafficPercent=%d",
+			fi.Spec.BlastRadius.DurationSeconds, fi.Spec.BlastRadius.MaxTrafficPercent,
 		)
 
 		log.Info("experiment started",
-			"name", fi.Name,
-			"namespace", fi.Namespace,
 			"startedAt", t.Format(time.RFC3339),
-			"durationSeconds", fi.Spec.BlastRadius.DurationSeconds,
 			"maxTrafficPercent", fi.Spec.BlastRadius.MaxTrafficPercent,
 		)
 	}
 
-	// ------------------------------------------------------------------
-	// Guardrail: invalid duration → fail closed
-	// ------------------------------------------------------------------
-	if fi.Spec.BlastRadius.DurationSeconds <= 0 {
-		log.Error(
-			nil,
-			"invalid blastRadius.durationSeconds; skipping expiresAt computation",
-			"name", fi.Name,
-			"namespace", fi.Namespace,
-			"durationSeconds", fi.Spec.BlastRadius.DurationSeconds,
-		)
-
-		r.Recorder.Eventf(
-			fi,
-			"Warning",
-			"InvalidDuration",
-			"Invalid blastRadius.durationSeconds=%d; experiment will not expire automatically",
-			fi.Spec.BlastRadius.DurationSeconds,
-		)
-
-		return changed
-	}
-
-	// Ultra-defensive: should never happen, but prevents panics
+	// From here, StartedAt must exist (but keep a safety net anyway).
 	if fi.Status.StartedAt == nil {
-		log.Error(
-			nil,
-			"StartedAt is nil after initialization; skipping expiresAt computation",
-			"name", fi.Name,
-			"namespace", fi.Namespace,
+		r.Recorder.Eventf(
+			fi, "Warning", "LifecycleError",
+			"internal error: StartedAt is nil after initialization",
 		)
+		log.Info("internal lifecycle error: startedAt is nil after initialization")
 		return changed
 	}
 
-	// ------------------------------------------------------------------
-	// ExpiresAt: deterministic recomputation
-	// ------------------------------------------------------------------
 	start := fi.Status.StartedAt.Time
-	expiresAt := start.Add(
-		time.Duration(fi.Spec.BlastRadius.DurationSeconds) * time.Second,
-	)
+	expiresAt := start.Add(time.Duration(durSeconds) * time.Second)
 
-	if fi.Status.ExpiresAt == nil {
+	// Set/refresh ExpiresAt.
+	if fi.Status.ExpiresAt == nil || !fi.Status.ExpiresAt.Time.Equal(expiresAt) {
 		t := metav1.NewTime(expiresAt)
 		fi.Status.ExpiresAt = &t
 		changed = true
 
-		log.Info("expiresAt initialized",
-			"name", fi.Name,
-			"namespace", fi.Namespace,
+		r.Recorder.Eventf(
+			fi, "Normal", "LifecycleUpdated",
+			"Lifecycle set; startedAt=%s expiresAt=%s",
+			fi.Status.StartedAt.Format(time.RFC3339),
+			t.Format(time.RFC3339),
+		)
+
+		log.Info("lifecycle updated",
+			"startedAt", fi.Status.StartedAt.Format(time.RFC3339),
 			"expiresAt", t.Format(time.RFC3339),
-		)
-
-		r.Recorder.Eventf(
-			fi,
-			"Normal",
-			"ExpiresAtSet",
-			"Experiment will expire at %s",
-			t.Format(time.RFC3339),
-		)
-
-		return changed
-	}
-
-	if !fi.Status.ExpiresAt.Time.Equal(expiresAt) {
-		old := fi.Status.ExpiresAt.Time
-		t := metav1.NewTime(expiresAt)
-		fi.Status.ExpiresAt = &t
-		changed = true
-
-		log.Info("expiresAt updated",
-			"name", fi.Name,
-			"namespace", fi.Namespace,
-			"oldExpiresAt", old.Format(time.RFC3339),
-			"newExpiresAt", t.Format(time.RFC3339),
-		)
-
-		r.Recorder.Eventf(
-			fi,
-			"Normal",
-			"ExpiresAtUpdated",
-			"Experiment expiration updated from %s to %s",
-			old.Format(time.RFC3339),
-			t.Format(time.RFC3339),
 		)
 	}
 
