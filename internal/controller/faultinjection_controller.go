@@ -246,41 +246,37 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 }
 
 // ensureLifecycle initializes and maintains the FaultInjection lifecycle timestamps.
-//
-// Behavior:
-//
-//   - On the first reconcile (Status.StartedAt == nil), it sets Status.StartedAt to "now"
-//     and emits a Normal "Started" event including durationSeconds/maxTrafficPercent.
-//   - It always computes Status.ExpiresAt = StartedAt + blastRadius.durationSeconds and
-//     stores it on the status.
-//
-// Notes:
-//
-//   - ExpiresAt is recomputed on every reconcile to remain consistent with StartedAt and
-//     the current spec duration.
-//   - This function only mutates the in-memory FaultInjection object; callers are
-//     responsible for persisting status updates if needed.
 func (r *FaultInjectionReconciler) ensureLifecycle(
 	log logr.Logger,
 	fi *chaosv1alpha1.FaultInjection,
 ) (changed bool) {
-
 	now := time.Now().UTC()
-	durSeconds := fi.Spec.BlastRadius.DurationSeconds
+
+	if fi == nil {
+		log.Info("nil FaultInjection passed to ensureLifecycle")
+		return false
+	}
+
+	br := fi.Spec.BlastRadius
+	durSeconds := br.DurationSeconds          // int64 (time math)
+	maxTrafficPercent := br.MaxTrafficPercent // int32 (0–100)
 
 	log = log.WithValues(
 		"name", fi.Name,
 		"namespace", fi.Namespace,
 		"durationSeconds", durSeconds,
+		"maxTrafficPercent", maxTrafficPercent,
 	)
 
-	// Fail-closed guard (admission should prevent, but keep reconciler resilient).
+	// Fail-closed guard (admission should prevent this, but keep reconciler resilient).
 	if durSeconds <= 0 {
-		r.Recorder.Eventf(
-			fi, "Warning", "InvalidSpec",
-			"blastRadius.durationSeconds must be > 0 (got %d); lifecycle not initialized",
-			durSeconds,
-		)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(
+				fi, "Warning", "InvalidSpec",
+				"blastRadius.durationSeconds must be > 0 (got %d)",
+				durSeconds,
+			)
+		}
 		log.Info("invalid durationSeconds; lifecycle not initialized", "durationSeconds", durSeconds)
 		return false
 	}
@@ -291,24 +287,28 @@ func (r *FaultInjectionReconciler) ensureLifecycle(
 		fi.Status.StartedAt = &t
 		changed = true
 
-		r.Recorder.Eventf(
-			fi, "Normal", "Started",
-			"Experiment started; durationSeconds=%d maxTrafficPercent=%d",
-			fi.Spec.BlastRadius.DurationSeconds, fi.Spec.BlastRadius.MaxTrafficPercent,
-		)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(
+				fi, "Normal", "Started",
+				"Experiment started; durationSeconds=%d maxTrafficPercent=%d",
+				durSeconds,
+				maxTrafficPercent,
+			)
+		}
 
 		log.Info("experiment started",
 			"startedAt", t.Format(time.RFC3339),
-			"maxTrafficPercent", fi.Spec.BlastRadius.MaxTrafficPercent,
 		)
 	}
 
-	// From here, StartedAt must exist (but keep a safety net anyway).
+	// Safety net (should never happen).
 	if fi.Status.StartedAt == nil {
-		r.Recorder.Eventf(
-			fi, "Warning", "LifecycleError",
-			"internal error: StartedAt is nil after initialization",
-		)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(
+				fi, "Warning", "LifecycleError",
+				"internal error: StartedAt is nil after initialization",
+			)
+		}
 		log.Info("internal lifecycle error: startedAt is nil after initialization")
 		return changed
 	}
@@ -316,21 +316,22 @@ func (r *FaultInjectionReconciler) ensureLifecycle(
 	start := fi.Status.StartedAt.Time
 	expiresAt := start.Add(time.Duration(durSeconds) * time.Second)
 
-	// Set/refresh ExpiresAt.
+	// Set / refresh ExpiresAt.
 	if fi.Status.ExpiresAt == nil || !fi.Status.ExpiresAt.Time.Equal(expiresAt) {
 		t := metav1.NewTime(expiresAt)
 		fi.Status.ExpiresAt = &t
 		changed = true
 
-		r.Recorder.Eventf(
-			fi, "Normal", "LifecycleUpdated",
-			"Lifecycle set; startedAt=%s expiresAt=%s",
-			fi.Status.StartedAt.Format(time.RFC3339),
-			t.Format(time.RFC3339),
-		)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(
+				fi, "Normal", "LifecycleUpdated",
+				"Lifecycle set; startedAt=%s expiresAt=%s",
+				fi.Status.StartedAt.Format(time.RFC3339),
+				t.Format(time.RFC3339),
+			)
+		}
 
 		log.Info("lifecycle updated",
-			"startedAt", fi.Status.StartedAt.Format(time.RFC3339),
 			"expiresAt", t.Format(time.RFC3339),
 		)
 	}
