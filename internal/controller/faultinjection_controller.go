@@ -260,7 +260,11 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 //     the current spec duration.
 //   - This function only mutates the in-memory FaultInjection object; callers are
 //     responsible for persisting status updates if needed.
-func (r *FaultInjectionReconciler) ensureLifecycle(log logr.Logger, fi *chaosv1alpha1.FaultInjection, now time.Time) bool {
+func (r *FaultInjectionReconciler) ensureLifecycle(
+	log logr.Logger,
+	fi *chaosv1alpha1.FaultInjection,
+	now time.Time,
+) bool {
 	changed := false
 
 	if fi.Status.StartedAt == nil {
@@ -282,10 +286,18 @@ func (r *FaultInjectionReconciler) ensureLifecycle(log logr.Logger, fi *chaosv1a
 		)
 	}
 
-	// Always recompute expiresAt from StartedAt + spec duration
-	expiresAt := fi.Status.StartedAt.Add(time.Duration(fi.Spec.BlastRadius.DurationSeconds) * time.Second)
+	// Fail-closed guard: avoid negative/zero durations creating confusing expiresAt.
+	// (Admission should prevent this, but keep reconciler resilient.)
+	if fi.Spec.BlastRadius.DurationSeconds <= 0 {
+		// Don’t change startedAt; just avoid setting expiresAt to “now or earlier”.
+		return changed
+	}
 
-	// Only mark changed if ExpiresAt is different or nil
+	// Always recompute expiresAt from StartedAt + spec duration.
+	start := fi.Status.StartedAt.Time
+	expiresAt := start.Add(time.Duration(fi.Spec.BlastRadius.DurationSeconds) * time.Second)
+
+	// Only mark changed if ExpiresAt is different or nil.
 	if fi.Status.ExpiresAt == nil || !fi.Status.ExpiresAt.Time.Equal(expiresAt) {
 		t := metav1.NewTime(expiresAt)
 		fi.Status.ExpiresAt = &t
