@@ -632,7 +632,9 @@ func (r *FaultInjectionReconciler) markRunning(ctx context.Context, log logr.Log
 //
 // The controller name is set to "faultinjection".
 func (r *FaultInjectionReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	mgr.GetEventRecorder("faultinjection-controller")
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("faultinjection-controller")
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&chaosv1alpha1.FaultInjection{}).
