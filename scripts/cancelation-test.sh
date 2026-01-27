@@ -1,4 +1,4 @@
-#!/usr/bin/env bash -x
+#!/usr/bin/env bash
 set -euo pipefail
 
 # ---- config (override via env) ----
@@ -114,7 +114,7 @@ wait_cleanup_gone() {
   done
 
   printf "---- managed VS still present ----\n%s\n" "${managed_vs:-<none>}"
-  printf "---- httpbin1 injected rules still present ----\n%s\n" "${injected_in_h1:-<none>}"
+  printf "---- injected rules still present (any VS) ----\n%s\n" "${injected_anywhere:-<none>}"
   fail "Timed out waiting for cleanup to finish"
 }
 
@@ -198,6 +198,6 @@ assert_code "INBOUND ABORT should stop" "200" "$pi3"
 assert_lt   "INBOUND ABORT should stop fast" "0.5" "$pi3"
 
 echo "=== ENVOY STATS (smoke) ==="
-in_pod "curl -s localhost:15000/stats | rg -n \"httpbin2\\.demo\\.svc\\.cluster\\.local\" | head -n 5 || true"
+in_pod "curl -s localhost:15000/stats | grep -n \"httpbin2.demo.svc.cluster.local\" | head -n 5 || true"
 
 echo "✅ ALL CANCELLATION TESTS PASSED"
