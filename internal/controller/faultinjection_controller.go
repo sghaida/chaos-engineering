@@ -211,6 +211,18 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return r.handleCancellation(ctx, log, req, &fi, now)
 	}
 
+	// If lifecycle not initialized yet, initialize and requeue.
+	if fi.Status.ExpiresAt == nil || fi.Status.StartedAt == nil {
+		if changed := r.ensureLifecycle(log, &fi); changed {
+			// Status was updated; requeue so we see persisted StartedAt/ExpiresAt
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		// Nothing changed (should be rare), but still stop this reconcile
+		// to avoid dereferencing nil StartedAt/ExpiresAt below.
+		return ctrl.Result{}, nil
+	}
+
 	// Expired => cleanup
 	if now.After(fi.Status.ExpiresAt.Time) {
 		return r.handleExpiry(ctx, log, &fi)
@@ -358,6 +370,11 @@ func (r *FaultInjectionReconciler) ensureLifecycle(
 //   - Returns (ctrl.Result{}, nil) on success (no requeue).
 //   - Returns an error if cleanup or status persistence fails.
 func (r *FaultInjectionReconciler) handleCancellation(ctx context.Context, log logr.Logger, req ctrl.Request, fi *chaosv1alpha1.FaultInjection, now time.Time) (ctrl.Result, error) {
+
+	if fi.Status.Phase == CancelledPhase || fi.Status.Phase == CompletedPhase {
+		return ctrl.Result{}, nil
+	}
+
 	if fi.Status.CancelledAt == nil {
 		r.Recorder.Event(fi, "Normal", "CancelRequested", "Cancellation requested via spec.cancel=true")
 	}

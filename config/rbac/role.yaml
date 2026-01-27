@@ -10,6 +10,9 @@ rules:
   - events
   verbs:
   - create
+  - patch
+  - update
+  - watch
 - apiGroups:
   - ""
   resources:
