@@ -43,7 +43,11 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd:allowDangerousTypes=true webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd:allowDangerousTypes=true webhook \
+		paths="./..." \
+		output:crd:artifacts:config=config/crd/bases \
+		output:rbac:artifacts:config=config/rbac
+
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -265,3 +269,21 @@ admission-control-test: ## Run ValidatingAdmissionPolicy usecase suite (server-s
 admission-control-sync: ## Auto-sync DENY EXPECT_MSG_CONTAINS from live API server (APPEND=1 recommended)
 	@cd "$(ADMISSION_POLICY_DIR)" && \
 	NS="$(ADMISSION_NS)" APPEND="$${APPEND:-1}" ./sync-expectations.sh
+
+.PHONY: ensure-and-clean
+ensure-and-clean:
+	RES_DIR=../resources ./scripts/ensure-and-clean.sh
+
+# ---- Local demo defaults (override on CLI) ----
+FI_NS ?= demo
+FI_NAME ?= fi-inbound-outbound-latency-timeout
+FI_RULE_PREFIX ?= fi-
+FI_SCRIPTS_DIR ?= ./scripts
+
+.PHONY: fi-cancel-test
+fi-cancel-test: ensure-and-clean ## Run FaultInjection cancellation test in the demo namespace
+	@echo ">> Running FaultInjection cancellation test (ns=$(FI_NS), fi=$(FI_NAME))"
+	NS="$(FI_NS)" \
+	FI_NAME="$(FI_NAME)" \
+	FI_RULE_PREFIX="$(FI_RULE_PREFIX)" \
+	"$(FI_SCRIPTS_DIR)/cancelation-test.sh"

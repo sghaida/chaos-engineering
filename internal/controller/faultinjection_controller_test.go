@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -36,8 +38,9 @@ var _ = Describe("FaultInjection Controller", func() {
 
 		By("reconciling")
 		controllerReconciler := &FaultInjectionReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(1024),
 		}
 
 		res, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -84,8 +87,9 @@ var _ = Describe("FaultInjection Controller", func() {
 
 		By("reconciling")
 		controllerReconciler := &FaultInjectionReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(1024),
 		}
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-outbound", Namespace: ns},
@@ -155,8 +159,9 @@ var _ = Describe("FaultInjection Controller", func() {
 
 		By("reconciling")
 		controllerReconciler := &FaultInjectionReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(1024),
 		}
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-noroute", Namespace: ns},
@@ -185,7 +190,11 @@ var _ = Describe("FaultInjection Controller", func() {
 		Expect(k8sClient.Create(ctx, fi)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, fi) }()
 
-		controllerReconciler := &FaultInjectionReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		controllerReconciler := &FaultInjectionReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(1024),
+		}
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-bad-percent", Namespace: ns},
 		})
@@ -223,7 +232,11 @@ var _ = Describe("FaultInjection Controller", func() {
 		Expect(k8sClient.Create(ctx, fi)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, fi) }()
 
-		controllerReconciler := &FaultInjectionReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		controllerReconciler := &FaultInjectionReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(1024),
+		}
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-bad-maxpods", Namespace: ns},
 		})
@@ -247,7 +260,11 @@ var _ = Describe("FaultInjection Controller", func() {
 			_ = k8sClient.Delete(ctx, testNewVirtualService(ns, "fi-fi-expire-latency"))
 		}()
 
-		controllerReconciler := &FaultInjectionReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		controllerReconciler := &FaultInjectionReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(1024),
+		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-expire", Namespace: ns},
@@ -339,7 +356,11 @@ var _ = Describe("FaultInjection Controller", func() {
 			_ = k8sClient.Delete(ctx, testNewVirtualService(ns, "fi-fi-cancel-out-latency"))
 		}()
 
-		controllerReconciler := &FaultInjectionReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		controllerReconciler := &FaultInjectionReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(1024),
+		}
 
 		By("reconciling once to apply faults (create managed VS + inject inbound rule)")
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -465,7 +486,11 @@ var _ = Describe("FaultInjection Controller", func() {
 			_ = k8sClient.Delete(ctx, testNewVirtualService(ns, "fi-fi-cancel-idem-out-latency"))
 		}()
 
-		controllerReconciler := &FaultInjectionReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		controllerReconciler := &FaultInjectionReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: record.NewFakeRecorder(1024),
+		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-cancel-idem", Namespace: ns},
@@ -518,6 +543,229 @@ var _ = Describe("FaultInjection Controller", func() {
 		Expect(st3["stopReason"]).To(Equal("external: spec.cancel=true"))
 	})
 
+	It("reconciles HTTP_ABORT for INBOUND: injects abort fault and keeps route", func() {
+		By("creating an inbound target VirtualService")
+		vs := testNewInboundVirtualService(ns, "abort-inbound-vs")
+		Expect(k8sClient.Create(ctx, vs)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, testNewVirtualService(ns, "abort-inbound-vs")) }()
+
+		By("creating a FaultInjection CR with HTTP_ABORT")
+		fi := testNewFaultInjectionUnstructured(ns, "fi-abort-in",
+			testFIActionInboundAbort("abort", "abort-inbound-vs", 10, 503),
+			testFIBlastRadius(60, 100, 0),
+		)
+		Expect(k8sClient.Create(ctx, fi)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, fi) }()
+
+		By("reconciling")
+		controllerReconciler := &FaultInjectionReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: testRecorder(),
+		}
+		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "fi-abort-in", Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("verifying injected rule has abort fault + route")
+		gotVS := testNewVirtualService(ns, "abort-inbound-vs")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "abort-inbound-vs", Namespace: ns}, gotVS)).To(Succeed())
+
+		http := testMustHTTPList(gotVS)
+		Expect(http).NotTo(BeEmpty())
+
+		r0 := testMustRuleMap(http[0])
+		Expect(r0["name"].(string)).To(HavePrefix("fi-fi-abort-in-"))
+		Expect(r0).To(HaveKey("route"))
+
+		fault := testMustRuleMap(r0["fault"])
+		abort := testMustRuleMap(fault["abort"])
+		Expect(abort["httpStatus"]).To(BeNumerically("==", 503))
+	})
+
+	It("reconciles HTTP_ABORT for OUTBOUND: creates managed VS and default route uses first host", func() {
+		fi := testNewFaultInjectionUnstructured(ns, "fi-abort-out",
+			testFIActionOutboundAbort("abort", []string{"b.example.com", "a.example.com"}, 10, 500, map[string]string{"app": "a"}),
+			testFIBlastRadius(60, 100, 0),
+		)
+		Expect(k8sClient.Create(ctx, fi)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, fi)
+			_ = k8sClient.Delete(ctx, testNewVirtualService(ns, "fi-fi-abort-out-abort"))
+		}()
+
+		controllerReconciler := &FaultInjectionReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: testRecorder(),
+		}
+		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "fi-abort-out", Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		managedName := "fi-fi-abort-out-abort"
+		gotVS := testNewVirtualService(ns, managedName)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: managedName, Namespace: ns}, gotVS)).To(Succeed())
+
+		spec := testMustSpecMap(gotVS)
+
+		By("hosts are sorted/deterministic")
+		hosts, ok := spec["hosts"].([]any)
+		Expect(ok).To(BeTrue())
+		Expect(hosts).To(Equal([]any{"a.example.com", "b.example.com"}))
+
+		By("default route points to the first host (a.example.com)")
+		http := testMustHTTPList(gotVS)
+		Expect(http).ToNot(BeEmpty())
+
+		// default rule is usually last after prepending injected rules, but it must exist.
+		// Find it by name prefix "default-".
+		var found bool
+		for _, it := range http {
+			rm := testMustRuleMap(it)
+			if n, _ := rm["name"].(string); strings.HasPrefix(n, "default-") || n == "default" {
+				route := rm["route"].([]any)
+				dst := testMustRuleMap(testMustRuleMap(route[0])["destination"])
+				Expect(dst["host"]).To(Equal("a.example.com"))
+				found = true
+				break
+			}
+		}
+		Expect(found).To(BeTrue(), "expected a default route rule to exist")
+	})
+
+	It("managed VS gateways: reconcile sets gateways=['mesh'] and does not duplicate on subsequent reconcile", func() {
+		fi := testNewFaultInjectionUnstructured(ns, "fi-gw",
+			testFIActionOutboundLatency("latency", []string{"example.com"}, 10, 1, map[string]string{"app": "a"}),
+			testFIBlastRadius(60, 100, 0),
+		)
+		Expect(k8sClient.Create(ctx, fi)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, fi)
+			_ = k8sClient.Delete(ctx, testNewVirtualService(ns, "fi-fi-gw-latency"))
+		}()
+
+		controllerReconciler := &FaultInjectionReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: testRecorder(),
+		}
+
+		By("first reconcile creates managed VS with mesh gateway")
+		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "fi-gw", Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		gotVS := testNewVirtualService(ns, "fi-fi-gw-latency")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fi-fi-gw-latency", Namespace: ns}, gotVS)).To(Succeed())
+		spec := testMustSpecMap(gotVS)
+		Expect(spec["gateways"]).To(Equal([]any{"mesh"}))
+
+		By("mutate gateways to include mesh already; second reconcile should not duplicate")
+		// simulate external change: keep mesh but also add another gw
+		spec["gateways"] = []any{"mesh", "some-other-gw"}
+		Expect(k8sClient.Update(ctx, gotVS)).To(Succeed())
+
+		_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "fi-gw", Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		gotVS2 := testNewVirtualService(ns, "fi-fi-gw-latency")
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "fi-fi-gw-latency", Namespace: ns}, gotVS2)).To(Succeed())
+		spec2 := testMustSpecMap(gotVS2)
+
+		// ensure no duplication introduced (still exactly 2, and includes mesh)
+		gw2 := spec2["gateways"].([]any)
+		Expect(gw2).To(Equal([]any{"mesh", "some-other-gw"}))
+	})
+
+	It("sanitizeName normalizes names and never returns empty", func() {
+		Expect(sanitizeName("  Hello_World ")).To(Equal("hello-world"))
+		Expect(sanitizeName("___")).To(Equal("x"))
+		Expect(sanitizeName("A!B@C")).To(Equal("a-b-c"))
+		Expect(sanitizeName("--hi--")).To(Equal("hi"))
+	})
+
+	It("uniqueAppend merges, de-duplicates, and sorts deterministically", func() {
+		base := []string{"b", "a"}
+		add := []string{"c", "a", "d"}
+		out := uniqueAppend(base, add)
+		Expect(out).To(Equal([]string{"a", "b", "c", "d"}))
+	})
+
+	It("splitKey handles normal and malformed keys", func() {
+		ns, name := splitKey("default/foo")
+		Expect(ns).To(Equal("default"))
+		Expect(name).To(Equal("foo"))
+
+		ns2, name2 := splitKey("no-slash")
+		Expect(ns2).To(Equal(""))
+		Expect(name2).To(Equal("no-slash"))
+	})
+
+	It("patchVirtualServiceHTTP handles missing spec/http and preserves non-map items; removes injected prefix", func() {
+		vs := testNewVirtualService("default", "x")
+
+		// case 1: no spec/http present
+		changed := patchVirtualServiceHTTP(vs, "fi-x-", []map[string]any{
+			{"name": "fi-x-a", "match": []any{}, "fault": map[string]any{}, "route": []any{map[string]any{"destination": map[string]any{"host": "h"}}}},
+		})
+		Expect(changed).To(BeTrue())
+		http := testMustHTTPList(vs)
+		Expect(http).To(HaveLen(1))
+
+		// case 2: existing includes injected + non-map item + normal map
+		vs2 := testNewVirtualService("default", "y")
+		vs2.Object["spec"] = map[string]any{
+			"http": []any{
+				map[string]any{"name": "fi-x-old", "match": []any{}}, // should be removed
+				"KEEP-ME", // must be preserved
+				map[string]any{"name": "user-rule", "match": []any{}}, // must be preserved
+			},
+		}
+
+		desired := []map[string]any{
+			{"name": "fi-x-new", "match": []any{}, "fault": map[string]any{}, "route": []any{map[string]any{"destination": map[string]any{"host": "h"}}}},
+		}
+
+		changed2 := patchVirtualServiceHTTP(vs2, "fi-x-", desired)
+		Expect(changed2).To(BeTrue())
+
+		h2 := testMustHTTPList(vs2)
+		Expect(h2).To(HaveLen(3)) // desired + KEEP-ME + user-rule
+
+		r0 := testMustRuleMap(h2[0])
+		Expect(r0["name"]).To(Equal("fi-x-new"))
+		Expect(h2[1]).To(Equal("KEEP-ME"))
+		r2 := testMustRuleMap(h2[2])
+		Expect(r2["name"]).To(Equal("user-rule"))
+
+		// case 3: applying same desired again should be "no change"
+		changed3 := patchVirtualServiceHTTP(vs2, "fi-x-", desired)
+		Expect(changed3).To(BeFalse())
+	})
+
+	It("ensureManagedOutboundVSGatewaysMesh sets gateways only for managed=true", func() {
+		vs := testNewVirtualService("default", "z")
+		vs.Object["spec"] = map[string]any{}
+
+		Expect(ensureManagedOutboundVSGatewaysMesh(vs, false)).To(BeFalse())
+
+		changed := ensureManagedOutboundVSGatewaysMesh(vs, true)
+		Expect(changed).To(BeTrue())
+
+		spec := testMustSpecMap(vs)
+		Expect(spec["gateways"]).To(Equal([]any{"mesh"}))
+
+		// idempotent if already has mesh
+		changed2 := ensureManagedOutboundVSGatewaysMesh(vs, true)
+		Expect(changed2).To(BeFalse())
+	})
+
 })
 
 /* -----------------------------
@@ -536,6 +784,7 @@ func testNewVirtualService(namespace, name string) *unstructured.Unstructured {
 	return vs
 }
 
+//nolint:unparam
 func testNewInboundVirtualService(namespace, name string) *unstructured.Unstructured {
 	vs := testNewVirtualService(namespace, name)
 	vs.Object["spec"] = map[string]any{
@@ -714,6 +963,7 @@ func testGetOrCreateMap(u *unstructured.Unstructured, key string) map[string]any
 	return m
 }
 
+//nolint:unparam
 func testGetOrCreateMapFrom(parent map[string]any, key string) map[string]any {
 	m, ok := parent[key].(map[string]any)
 	if !ok || m == nil {
@@ -723,6 +973,7 @@ func testGetOrCreateMapFrom(parent map[string]any, key string) map[string]any {
 	return m
 }
 
+//nolint:unparam
 func testGetOrCreateSliceFrom(parent map[string]any, key string) []any {
 	s, ok := parent[key].([]any)
 	if !ok || s == nil {
@@ -755,4 +1006,87 @@ func testForceFIStartedAt(ctx context.Context, fi *unstructured.Unstructured, st
 	}
 	st["startedAt"] = metav1.NewTime(startedAt).Format(time.RFC3339)
 	return k8sClient.Status().Update(ctx, fi)
+}
+
+func testRecorder() record.EventRecorder {
+	return record.NewFakeRecorder(1024)
+}
+
+func testFIActionInboundAbort(actionName, vsName string, percent int64, httpStatus int64) func(*unstructured.Unstructured) {
+	return func(fi *unstructured.Unstructured) {
+		spec := testGetOrCreateMap(fi, "spec")
+		actions := testGetOrCreateMapFrom(spec, "actions")
+		meshFaults := testGetOrCreateSliceFrom(actions, "meshFaults")
+
+		meshFaults = append(meshFaults, map[string]any{
+			"name":      actionName,
+			"type":      "HTTP_ABORT",
+			"direction": "INBOUND",
+			"percent":   percent,
+			"http": map[string]any{
+				"virtualServiceRef": map[string]any{"name": vsName},
+				"routes": []any{
+					map[string]any{
+						"match": map[string]any{
+							"uriPrefix": "/",
+							"headers":   map[string]any{},
+						},
+					},
+				},
+				"abort": map[string]any{"httpStatus": httpStatus},
+			},
+		})
+
+		actions["meshFaults"] = meshFaults
+		spec["actions"] = actions
+	}
+}
+
+func testFIActionOutboundAbort(actionName string, hosts []string, percent int64, httpStatus int64, sourceLabels map[string]string) func(*unstructured.Unstructured) {
+	return func(fi *unstructured.Unstructured) {
+		spec := testGetOrCreateMap(fi, "spec")
+		actions := testGetOrCreateMapFrom(spec, "actions")
+		meshFaults := testGetOrCreateSliceFrom(actions, "meshFaults")
+
+		h := make([]any, 0, len(hosts))
+		for _, s := range hosts {
+			h = append(h, s)
+		}
+
+		var srcSel any
+		if len(sourceLabels) > 0 {
+			m := map[string]any{}
+			for k, v := range sourceLabels {
+				m[k] = v
+			}
+			srcSel = map[string]any{"matchLabels": m}
+		}
+
+		http := map[string]any{
+			"destinationHosts": h,
+			"routes": []any{
+				map[string]any{
+					"match": map[string]any{
+						"uriPrefix": "/",
+						"headers":   map[string]any{},
+					},
+				},
+			},
+			"abort": map[string]any{"httpStatus": httpStatus},
+		}
+		if srcSel != nil {
+			http["sourceSelector"] = srcSel
+		}
+
+		meshFaults = append(meshFaults, map[string]any{
+			"name":      actionName,
+			"type":      "HTTP_ABORT",
+			"direction": "OUTBOUND",
+			"percent":   percent,
+			"http":      http,
+		})
+
+		actions["meshFaults"] = meshFaults
+		spec["actions"] = actions
+	}
 }

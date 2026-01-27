@@ -13,7 +13,7 @@
 //     rules and marks the experiment Completed.
 //
 //   - Guardrails: The reconciler validates spec constraints (duration, traffic
-//     percentage bounds, required fields per action type/direction, and optional
+//     percentage bounds, required fre clearly ields per action type/direction, and optional
 //     maxPodsAffected enforcement). Invalid specs fail closed: injected rules are
 //     removed and the FaultInjection is moved to Error phase.
 //
@@ -58,6 +58,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	chaosv1alpha1 "github.com/sghaida/fi-operator/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -65,6 +66,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -112,6 +115,9 @@ type FaultInjectionReconciler struct {
 
 	// Scheme is the runtime scheme used to set controller references for managed resources.
 	Scheme *runtime.Scheme
+
+	// Recorder is an event recorder for emitting Kubernetes events.
+	Recorder record.EventRecorder
 }
 
 // Reconcile performs reconciliation for a single FaultInjection resource.
@@ -122,13 +128,8 @@ type FaultInjectionReconciler struct {
 //   - Istio VirtualService read/write for applying/creating fault rules
 //   - Pod list access for enforcing blastRadius.maxPodsAffected
 //   - Deployment list/delete for demo workload cleanup
-//
-// +kubebuilder:rbac:groups=chaos.sghaida.io,resources=faultinjections,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=chaos.sghaida.io,resources=faultinjections/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=chaos.sghaida.io,resources=faultinjections/finalizers,verbs=update
-// +kubebuilder:rbac:groups=networking.istio.io,resources=virtualservices,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;delete
+//   - Event create for emitting events
+//   - Namespace get/list for pod counting across namespaces
 //
 // Reconcile ensures the desired fault-injection rules are applied to the correct VirtualService targets and that experiments are automatically cleaned up after expiry.
 //
@@ -157,6 +158,7 @@ type FaultInjectionReconciler struct {
 // Note: This controller intentionally stores injected rules by name prefix. It does not
 // attempt to merge or diff arbitrary user-authored rules beyond removing prior injected
 // entries and prepending desired rules.
+// Reconcile assumes it has full ownership of any rules it has injected.
 func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -164,123 +166,361 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.Get(ctx, req.NamespacedName, &fi); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	log.Info("reconcile",
+		"name", fi.Name,
+		"ns", fi.Namespace,
+		"generation", fi.GetGeneration(),
+		"resourceVersion", fi.GetResourceVersion(),
+		"cancel", fi.Spec.Cancel,
+		"durationSeconds", fi.Spec.BlastRadius.DurationSeconds,
+		"phase", fi.Status.Phase,
+		"startedAt", fi.Status.StartedAt,
+		"expiresAt", fi.Status.ExpiresAt,
+	)
 
-	// 1) Lifecycle timestamps
 	now := time.Now()
-	if fi.Status.StartedAt == nil {
-		t := metav1.NewTime(now)
-		fi.Status.StartedAt = &t
-	}
-	expiresAt := fi.Status.StartedAt.Add(time.Duration(fi.Spec.BlastRadius.DurationSeconds) * time.Second)
-	t := metav1.NewTime(expiresAt)
-	fi.Status.ExpiresAt = &t
 
-	// Cancelled => immediate cleanup (GitOps/kubectl stop switch)
-	// this could be triggered in one of the following ways:
-	//
-	// 1) Merge patch
-	// 		kubectl -n <namespace> patch faultinjection <experiment name> \
-	// 		--type=merge -p '{"spec":{"cancel":true}}'
-	//
-	// 2) JSON patch
-	//		kubectl -n <namespace> patch faultinjection <experiment name> \
-	//		--type=json -p='[{"op":"replace","path":"/spec/cancel","value":true}]'
-	// If spec.cancel already exists and you want to force it:
-	// 		kubectl -n <namespace> patch faultinjection <experiment name> \
-	//		--type=json -p='[{"op":"replace","path":"/spec/cancel","value":true}]'
-	//
-	// 3) Trigger cancellation via Argo CD sync
-	// spec:
-	//   cancel: true
-	// commit and push to Git repo monitored by CD
-	//
-	// 4) Emergency (live patch) — use with care
-	// You can patch live (like kubectl),
-	// but Argo will revert it back to git state on the next sync unless you also commit the change.
-	if fi.Spec.Cancel {
-		log.Info("experiment cancelled; cleaning up immediately", "name", fi.Name, "ns", fi.Namespace)
+	lifecycleChanged := r.ensureLifecycle(log, &fi, now)
+	if lifecycleChanged {
+		// Persist StartedAt/ExpiresAt immediately (handles durationSeconds patch correctly)
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var latest chaosv1alpha1.FaultInjection
+			if err := r.Get(ctx, req.NamespacedName, &latest); err != nil {
+				return err
+			}
 
-		if err := r.cleanupAll(ctx, &fi); err != nil {
+			// Copy only lifecycle fields (avoid clobbering other status written elsewhere)
+			latest.Status.StartedAt = fi.Status.StartedAt
+			latest.Status.ExpiresAt = fi.Status.ExpiresAt
+
+			return r.Status().Update(ctx, &latest)
+		}); err != nil {
+			log.Error(err, "failed to persist lifecycle status", "name", fi.Name, "ns", fi.Namespace)
+			r.Recorder.Eventf(&fi, "Warning", "StatusUpdateFailed", "Failed to persist lifecycle status: %v", err)
 			return ctrl.Result{}, err
 		}
 
-		fi.Status.Phase = CancelledPhase
-		fi.Status.Message = "Cancelled: cleaned up injected rules"
-
-		// Set once (don’t keep changing timestamps/reason on repeated reconciles)
-		if fi.Status.CancelledAt == nil {
-			ct := metav1.NewTime(now)
-			fi.Status.CancelledAt = &ct
+		// Reload so subsequent logic uses persisted values (optional but nice)
+		if err := r.Get(ctx, req.NamespacedName, &fi); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
-		if fi.Status.StopReason == "" {
-			fi.Status.StopReason = "external: spec.cancel=true"
-		}
+	}
 
-		_ = r.Status().Update(ctx, &fi)
-		return ctrl.Result{}, nil
+	// Cancelled => immediate cleanup
+	if fi.Spec.Cancel {
+		return r.handleCancellation(ctx, log, req, &fi, now)
 	}
 
 	// Expired => cleanup
 	if now.After(fi.Status.ExpiresAt.Time) {
-		log.Info("experiment expired; cleaning up", "name", fi.Name, "ns", fi.Namespace)
-		if err := r.cleanupAll(ctx, &fi); err != nil {
-			return ctrl.Result{}, err
-		}
-		fi.Status.Phase = "Completed"
-		fi.Status.Message = "Expired: cleaned up injected rules"
-		_ = r.Status().Update(ctx, &fi)
-		return ctrl.Result{}, nil
+		return r.handleExpiry(ctx, log, &fi)
 	}
 
-	// 2) Guardrails
+	// Guardrails
 	if err := r.validateSpec(ctx, &fi); err != nil {
-		_ = r.cleanupAll(ctx, &fi)
-		fi.Status.Phase = ErrorPhase
-		fi.Status.Message = err.Error()
-		_ = r.Status().Update(ctx, &fi)
-		return ctrl.Result{}, nil
+		return r.handleValidationError(ctx, log, &fi, err)
 	}
 
-	// 3) Desired rules grouped by VS
 	desiredByVSTarget, managedVSNames := r.buildDesiredByVSTarget(&fi)
 
-	// 4) Apply patches (prepend injected rules)
+	stop, err := r.applyDesiredTargets(ctx, log, &fi, desiredByVSTarget)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Terminal/stop conditions (e.g., unsafe INBOUND target) must not fall through and
+	// overwrite status with Running.
+	if stop {
+		return ctrl.Result{}, nil
+	}
+
+	if err := r.cleanupOrphanedManagedVS(ctx, &fi, managedVSNames); err != nil {
+		log.Error(err, "failed cleanupOrphanedManagedVS", "name", fi.Name, "ns", fi.Namespace)
+		r.Recorder.Eventf(&fi, "Warning", "OrphanCleanupFailed", "Failed cleaning orphaned managed VirtualServices: %v", err)
+	}
+
+	if err := r.markRunning(ctx, log, &fi); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: time.Until(fi.Status.ExpiresAt.Time)}, nil
+}
+
+// ensureLifecycle initializes and maintains the FaultInjection lifecycle timestamps.
+//
+// Behavior:
+//
+//   - On the first reconcile (Status.StartedAt == nil), it sets Status.StartedAt to "now"
+//     and emits a Normal "Started" event including durationSeconds/maxTrafficPercent.
+//   - It always computes Status.ExpiresAt = StartedAt + blastRadius.durationSeconds and
+//     stores it on the status.
+//
+// Notes:
+//
+//   - ExpiresAt is recomputed on every reconcile to remain consistent with StartedAt and
+//     the current spec duration.
+//   - This function only mutates the in-memory FaultInjection object; callers are
+//     responsible for persisting status updates if needed.
+func (r *FaultInjectionReconciler) ensureLifecycle(log logr.Logger, fi *chaosv1alpha1.FaultInjection, now time.Time) bool {
+	changed := false
+
+	if fi.Status.StartedAt == nil {
+		t := metav1.NewTime(now)
+		fi.Status.StartedAt = &t
+		changed = true
+
+		r.Recorder.Eventf(
+			fi, "Normal", "Started",
+			"Experiment started; durationSeconds=%d maxTrafficPercent=%d",
+			fi.Spec.BlastRadius.DurationSeconds, fi.Spec.BlastRadius.MaxTrafficPercent,
+		)
+
+		log.Info("experiment started",
+			"name", fi.Name,
+			"ns", fi.Namespace,
+			"durationSeconds", fi.Spec.BlastRadius.DurationSeconds,
+			"maxTrafficPercent", fi.Spec.BlastRadius.MaxTrafficPercent,
+		)
+	}
+
+	// Always recompute expiresAt from StartedAt + spec duration
+	expiresAt := fi.Status.StartedAt.Add(time.Duration(fi.Spec.BlastRadius.DurationSeconds) * time.Second)
+
+	// Only mark changed if ExpiresAt is different or nil
+	if fi.Status.ExpiresAt == nil || !fi.Status.ExpiresAt.Time.Equal(expiresAt) {
+		t := metav1.NewTime(expiresAt)
+		fi.Status.ExpiresAt = &t
+		changed = true
+	}
+
+	return changed
+}
+
+// handleCancellation performs immediate cleanup when spec.cancel=true.
+//
+// Behavior:
+//
+//   - Emits a Normal "CancelRequested" event (only once) when cancellation is first observed.
+//   - Calls cleanupAll to remove injected rules, delete managed outbound VirtualServices,
+//     and delete FI-owned Deployments (best-effort).
+//   - Persists status using a conflict-retry:
+//   - Status.Phase = Cancelled
+//   - Status.Message = "Cancelled: cleaned up injected rules"
+//   - Status.CancelledAt is set once and remains stable across repeated reconciles
+//   - Status.StopReason defaults to "external: spec.cancel=true" if unset
+//   - Emits a Normal "Cancelled" event on successful completion.
+//
+// Return value:
+//
+//   - Returns (ctrl.Result{}, nil) on success (no requeue).
+//   - Returns an error if cleanup or status persistence fails.
+func (r *FaultInjectionReconciler) handleCancellation(ctx context.Context, log logr.Logger, req ctrl.Request, fi *chaosv1alpha1.FaultInjection, now time.Time) (ctrl.Result, error) {
+	if fi.Status.CancelledAt == nil {
+		r.Recorder.Event(fi, "Normal", "CancelRequested", "Cancellation requested via spec.cancel=true")
+	}
+
+	log.Info("experiment cancellation requested; starting cleanup", "name", fi.Name, "ns", fi.Namespace)
+	r.Recorder.Event(fi, "Normal", "CleanupStarted", "Starting cleanup for cancelled experiment")
+
+	if err := r.cleanupAll(ctx, fi); err != nil {
+		log.Error(err, "cancellation cleanup failed", "name", fi.Name, "ns", fi.Namespace)
+		r.Recorder.Eventf(fi, "Warning", "CleanupFailed", "Cancellation cleanup failed: %v", err)
+		return ctrl.Result{}, err
+	}
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest chaosv1alpha1.FaultInjection
+		if err := r.Get(ctx, req.NamespacedName, &latest); err != nil {
+			return err
+		}
+
+		latest.Status.Phase = CancelledPhase
+		latest.Status.Message = "Cancelled: cleaned up injected rules"
+
+		if latest.Status.CancelledAt == nil {
+			ct := metav1.NewTime(now)
+			latest.Status.CancelledAt = &ct
+		}
+		if latest.Status.StopReason == "" {
+			latest.Status.StopReason = "external: spec.cancel=true"
+		}
+
+		return r.Status().Update(ctx, &latest)
+	}); err != nil {
+		log.Error(err, "failed to persist Cancelled status after cancellation", "name", fi.Name, "ns", fi.Namespace)
+		r.Recorder.Eventf(fi, "Warning", "StatusUpdateFailed", "Failed to persist Cancelled status: %v", err)
+		return ctrl.Result{}, err
+	}
+
+	r.Recorder.Event(fi, "Normal", "Cancelled", "Experiment cancelled; cleanup completed")
+	log.Info("experiment cancelled; cleanup completed", "name", fi.Name, "ns", fi.Namespace)
+	return ctrl.Result{}, nil
+}
+
+// handleExpiry performs cleanup when the experiment has expired (now > Status.ExpiresAt).
+//
+// Behavior:
+//
+//   - Calls cleanupAll to remove injected rules, delete managed outbound VirtualServices,
+//     and delete FI-owned Deployments (best-effort).
+//   - Updates status on the current object:
+//   - Status.Phase = Completed
+//   - Status.Message = "Expired: cleaned up injected rules"
+//   - Emits Normal events for cleanup start and completion ("Expired").
+//
+// Return value:
+//
+//   - Returns (ctrl.Result{}, nil) on success (no requeue).
+//   - Returns an error if cleanupAll fails or the status update fails.
+func (r *FaultInjectionReconciler) handleExpiry(ctx context.Context, log logr.Logger, fi *chaosv1alpha1.FaultInjection) (ctrl.Result, error) {
+	log.Info("experiment expired; starting cleanup", "name", fi.Name, "ns", fi.Namespace, "expiresAt", fi.Status.ExpiresAt.Time)
+	r.Recorder.Event(fi, "Normal", "CleanupStarted", "Starting cleanup for expired experiment")
+
+	if err := r.cleanupAll(ctx, fi); err != nil {
+		log.Error(err, "expiry cleanup failed", "name", fi.Name, "ns", fi.Namespace)
+		r.Recorder.Eventf(fi, "Warning", "CleanupFailed", "Expiry cleanup failed: %v", err)
+		return ctrl.Result{}, err
+	}
+
+	fi.Status.Phase = CompletedPhase
+	fi.Status.Message = "Expired: cleaned up injected rules"
+
+	if err := r.Status().Update(ctx, fi); err != nil {
+		log.Error(err, "failed to persist Completed status after expiry", "name", fi.Name, "ns", fi.Namespace)
+		r.Recorder.Eventf(fi, "Warning", "StatusUpdateFailed", "Failed to persist Completed status after expiry: %v", err)
+		return ctrl.Result{}, err
+	}
+
+	r.Recorder.Event(fi, "Normal", "Expired", "Experiment expired; cleanup completed")
+	log.Info("experiment expired; cleanup completed", "name", fi.Name, "ns", fi.Namespace)
+	return ctrl.Result{}, nil
+}
+
+// handleValidationError handles guardrail or spec-validation failures.
+//
+// This function is invoked when validateSpec returns an error and ensures the
+// system fails closed without leaving partial or unsafe state behind.
+//
+// Behavior:
+//
+//   - Emits a Warning "ValidationFailed" event describing the rejection reason.
+//   - Emits a Normal "CleanupStarted" event indicating cleanup is beginning.
+//   - Calls cleanupAll to:
+//   - remove injected rules from all affected VirtualServices
+//   - delete managed outbound VirtualServices owned by the FaultInjection
+//   - delete FI-owned Deployments (best-effort)
+//   - Sets FaultInjection status:
+//   - Status.Phase   = Error
+//   - Status.Message = err.Error()
+//   - Persists the Error status via Status().Update.
+//
+// Failure handling:
+//
+//   - If cleanupAll fails, the error is logged and surfaced via events, but the
+//     controller still attempts to mark the FaultInjection Error.
+//   - If the status update itself fails, the error is returned and reconciliation
+//     is aborted.
+//
+// Return value:
+//
+//   - Returns nil if the Error status is successfully persisted.
+//   - Returns an error only if the status update fails (terminal reconciliation error).
+//
+// Design notes:
+//
+//   - This function ensures invalid or unsafe specifications never leave injected
+//     fault rules active.
+//   - Cleanup is best-effort but status correctness is treated as mandatory.
+//   - Reconciliation stops after this handler; no requeue is scheduled.
+func (r *FaultInjectionReconciler) handleValidationError(ctx context.Context, log logr.Logger, fi *chaosv1alpha1.FaultInjection, verr error) (ctrl.Result, error) {
+	log.Error(verr, "spec validation failed; starting cleanup", "name", fi.Name, "ns", fi.Namespace)
+	r.Recorder.Eventf(fi, "Warning", "ValidationFailed", "Spec rejected: %v", verr)
+	r.Recorder.Event(fi, "Normal", "CleanupStarted", "Starting cleanup after spec validation failure")
+
+	if cerr := r.cleanupAll(ctx, fi); cerr != nil {
+		log.Error(cerr, "cleanup after validation failure failed", "name", fi.Name, "ns", fi.Namespace)
+		r.Recorder.Eventf(fi, "Warning", "CleanupFailed", "Cleanup after validation failure failed: %v", cerr)
+	}
+
+	fi.Status.Phase = ErrorPhase
+	fi.Status.Message = verr.Error()
+
+	if err := r.Status().Update(ctx, fi); err != nil {
+		log.Error(err, "failed to persist Error status after validation failure", "name", fi.Name, "ns", fi.Namespace)
+		r.Recorder.Eventf(fi, "Warning", "StatusUpdateFailed", "Failed to persist Error status after validation failure: %v", err)
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// applyDesiredTargets applies the desired injected HTTP rules to all VirtualService targets.
+//
+// Inputs:
+//
+//   - desiredByVSTarget: map keyed by "<namespace>/<virtualservice-name>"
+//     containing desired injected rules and metadata (managed/hosts).
+//
+// For each target:
+//
+//   - Fetches the VirtualService, or creates it when desired.Managed=true (OUTBOUND).
+//   - Ensures managed outbound VirtualServices attach to the mesh gateway.
+//   - Ensures injected rules are schema-valid by guaranteeing a routable action:
+//   - INBOUND: clones a base route from an existing rule in the target VS.
+//   - OUTBOUND(managed): ensures a default route rule exists and uses it as baseRoute.
+//   - INBOUND with no routable rule anywhere fails closed (no injection) and sets Error status.
+//   - Removes previously injected rules by name prefix and prepends the desired injected rules.
+//   - Persists the VirtualService only when needed (created/changed/gateway-changed).
+//   - Emits events for create/patch and for unsafe targets.
+//
+// Notes:
+//
+//   - This function mutates VirtualService objects and performs Update/Create calls.
+//   - On certain errors, it updates FaultInjection status to Error and may return early.
+//   - It does not delete orphaned managed VS; that is handled by cleanupOrphanedManagedVS.
+func (r *FaultInjectionReconciler) applyDesiredTargets(
+	ctx context.Context,
+	log logr.Logger,
+	fi *chaosv1alpha1.FaultInjection,
+	desiredByVSTarget map[string]vsDesired,
+) (bool, error) {
 	for targetKey, desired := range desiredByVSTarget {
 		vsNS, vsName := splitKey(targetKey)
 
-		vs, created, err := r.getOrCreateVirtualService(ctx, &fi, vsNS, vsName, desired)
+		vs, created, err := r.getOrCreateVirtualService(ctx, fi, vsNS, vsName, desired)
 		if err != nil {
+			log.Error(err, "failed getting/creating VirtualService", "fi", fi.Name, "vsNS", vsNS, "vsName", vsName)
+			r.Recorder.Eventf(fi, "Warning", "VirtualServiceGetOrCreateFailed", "Failed getting/creating VirtualService %s/%s: %v", vsNS, vsName, err)
+
 			fi.Status.Phase = ErrorPhase
 			fi.Status.Message = fmt.Sprintf("failed getting/creating VirtualService %s/%s: %v", vsNS, vsName, err)
-			_ = r.Status().Update(ctx, &fi)
-			return ctrl.Result{}, err
+			_ = r.Status().Update(ctx, fi)
+			return false, err
 		}
 
-		// IMPORTANT:
-		// For managed OUTBOUND VirtualServices, explicitly attach to the mesh gateway.
-		// This avoids ambiguity where a VirtualService with hosts+http rules exists but is not applied to sidecar egress traffic.
 		meshGatewayChanged := ensureManagedOutboundVSGatewaysMesh(vs, desired.Managed)
 
-		// IMPORTANT:
-		// We must ensure each injected HTTP rule has a valid "route" (or redirect/direct_response).
-		// For INBOUND we clone a "base route" from the existing VS.
 		baseRoute, ok := findAnyExistingRoute(vs)
 		if !ok {
-			// If VS was just created and has empty http rules, we still must have a route.
-			// For managed (OUTBOUND) VS, build a default route to the destination hosts.
-			// For referenced INBOUND VS with no route anywhere, fail closed.
 			if desired.Managed {
 				baseRoute = buildManagedOutboundDefaultRoute(desired.Hosts)
 				ensureVSHasAtLeastOneDefaultRouteRule(vs, desired.Hosts)
+
+				r.Recorder.Eventf(fi, "Normal", "DefaultRouteEnsured", "Ensured default route for managed VirtualService %s/%s (hosts=%v)", vsNS, vsName, desired.Hosts)
 			} else {
 				fi.Status.Phase = ErrorPhase
-				fi.Status.Message = fmt.Sprintf("target VirtualService %s/%s has no route/redirect/direct_response in any http rule; cannot inject faults safely", vsNS, vsName)
-				_ = r.Status().Update(ctx, &fi)
-				return ctrl.Result{}, nil
+				fi.Status.Message = fmt.Sprintf(
+					"target VirtualService %s/%s has no route/redirect/direct_response in any http rule; cannot inject faults safely",
+					vsNS, vsName,
+				)
+
+				r.Recorder.Eventf(fi, "Warning", "UnsafeTarget", "Target VirtualService %s/%s has no route/redirect/direct_response; cannot inject faults safely", vsNS, vsName)
+				_ = r.Status().Update(ctx, fi)
+
+				// IMPORTANT: stop reconciliation so markRunning does not overwrite Error.
+				return true, nil
 			}
 		}
 
-		// Attach route to each desired rule (if missing) and keep timeout at correct level.
 		desiredRules := make([]map[string]any, 0, len(desired.Rules))
 		for _, rule := range desired.Rules {
 			rule = cloneMap(rule)
@@ -288,28 +528,57 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			desiredRules = append(desiredRules, rule)
 		}
 
-		changed := patchVirtualServiceHTTP(vs, fiRuleNamePrefix(&fi), desiredRules)
+		changed := patchVirtualServiceHTTP(vs, fiRuleNamePrefix(fi), desiredRules)
 
 		if created || changed || meshGatewayChanged {
 			if err := r.Update(ctx, vs); err != nil {
-				fi.Status.Phase = "Error"
-				fi.Status.Message = fmt.Sprintf("failed updating VirtualService %s/%s: %v", vsNS, vsName, err)
-				_ = r.Status().Update(ctx, &fi)
-				return ctrl.Result{}, err
+				r.Recorder.Eventf(fi, "Warning", "VirtualServiceUpdateFailed", "Failed updating VirtualService %s/%s: %v", vsNS, vsName, err)
+				return false, err
+			}
+
+			if created {
+				r.Recorder.Eventf(fi, "Normal", "VirtualServiceCreated", "Created managed VirtualService %s/%s", vsNS, vsName)
+			} else if changed || meshGatewayChanged {
+				r.Recorder.Eventf(fi, "Normal", "VirtualServicePatched", "Patched VirtualService %s/%s (injected rules updated)", vsNS, vsName)
 			}
 		}
 	}
+	return false, nil
+}
 
-	// 5) Cleanup orphaned managed VS
-	if err := r.cleanupOrphanedManagedVS(ctx, &fi, managedVSNames); err != nil {
-		log.Error(err, "failed cleanupOrphanedManagedVS")
+// markRunning sets the FaultInjection status to Running and emits the "Active" event when transitioning.
+//
+// Behavior:
+//
+//   - Sets:
+//   - Status.Phase = Running
+//   - Status.Message = "Active: injected rules are applied"
+//   - Emits a Normal "Active" event only when transitioning into Running
+//     (i.e., when the previous phase was not Running).
+//   - Persists the status update via r.Status().Update.
+//
+// Return value:
+//
+//   - Returns nil if status persistence succeeds.
+//   - Returns an error if the status update fails.
+func (r *FaultInjectionReconciler) markRunning(ctx context.Context, log logr.Logger, fi *chaosv1alpha1.FaultInjection) error {
+	wasRunning := fi.Status.Phase == RunningPhase
+
+	fi.Status.Phase = RunningPhase
+	fi.Status.Message = "Active: injected rules are applied"
+
+	if !wasRunning {
+		r.Recorder.Event(fi, "Normal", "Active", "Experiment is active; injected rules are applied")
+		log.Info("experiment is active", "name", fi.Name, "ns", fi.Namespace, "expiresAt", fi.Status.ExpiresAt.Time)
 	}
 
-	fi.Status.Phase = "Running"
-	fi.Status.Message = "Active: injected rules are applied"
-	_ = r.Status().Update(ctx, &fi)
+	if err := r.Status().Update(ctx, fi); err != nil {
+		log.Error(err, "failed to persist Running status", "name", fi.Name, "ns", fi.Namespace)
+		r.Recorder.Eventf(fi, "Warning", "StatusUpdateFailed", "Failed to persist FaultInjection status: %v", err)
+		return err
+	}
 
-	return ctrl.Result{RequeueAfter: time.Until(fi.Status.ExpiresAt.Time)}, nil
+	return nil
 }
 
 // SetupWithManager registers the reconciler with the controller-runtime manager.
@@ -319,6 +588,8 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 //
 // The controller name is set to "faultinjection".
 func (r *FaultInjectionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.Recorder = mgr.GetEventRecorderFor("faultinjection")
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&chaosv1alpha1.FaultInjection{}).
 		Named("faultinjection").
@@ -703,7 +974,7 @@ func buildInjectedHTTPRule(fi *chaosv1alpha1.FaultInjection, a *chaosv1alpha1.Me
 			match["headers"] = h
 		}
 
-		if a.Direction == "OUTBOUND" && a.HTTP.SourceSelector != nil && len(a.HTTP.SourceSelector.MatchLabels) > 0 {
+		if a.Direction == OUTBOUNDDirection && a.HTTP.SourceSelector != nil && len(a.HTTP.SourceSelector.MatchLabels) > 0 {
 			match["sourceLabels"] = a.HTTP.SourceSelector.MatchLabels
 		}
 
@@ -853,8 +1124,6 @@ func ensureVSHasAtLeastOneDefaultRouteRule(vs *unstructured.Unstructured, hosts 
 	vs.Object["spec"] = spec
 }
 
-// --- cleanup logic (unchanged) ---
-
 // cleanupAll removes injected rules from all VirtualServices impacted by this FaultInjection
 // and deletes any managed outbound VirtualServices owned by the FaultInjection.
 //
@@ -870,21 +1139,28 @@ func ensureVSHasAtLeastOneDefaultRouteRule(vs *unstructured.Unstructured, hosts 
 // cleanupAll is used in two main scenarios:
 //   - experiment expiry (mark Completed)
 //   - guardrail failures (mark Error)
+//   - cancellation by user (mark Cancelled)
+//
+// It is best-effort: it continues processing other targets even if some fail,
+// and only returns an error if a non-recoverable error occurs (e.g., List failure).
 func (r *FaultInjectionReconciler) cleanupAll(ctx context.Context, fi *chaosv1alpha1.FaultInjection) error {
 	targets := map[string]struct{}{}
 
 	for _, a := range fi.Spec.Actions.MeshFaults {
-		if a.Direction == "INBOUND" && a.HTTP.VirtualServiceRef != nil {
+		if a.Direction == INBOUNDDirection && a.HTTP.VirtualServiceRef != nil {
 			targets[joinKey(fi.Namespace, a.HTTP.VirtualServiceRef.Name)] = struct{}{}
 		}
-		if a.Direction == "OUTBOUND" {
+		if a.Direction == OUTBOUNDDirection {
 			targets[joinKey(fi.Namespace, managedOutboundVSName(fi, &a))] = struct{}{}
 		}
 	}
 
 	var vsList unstructured.UnstructuredList
 	vsList.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1beta1", Kind: "VirtualServiceList"})
-	_ = r.List(ctx, &vsList, client.InNamespace(fi.Namespace), client.MatchingLabels{"chaos.sghaida.io/fi": fi.Name})
+	if err := r.List(ctx, &vsList, client.InNamespace(fi.Namespace), client.MatchingLabels{"chaos.sghaida.io/fi": fi.Name}); err != nil {
+		r.Recorder.Eventf(fi, "Warning", "CleanupListFailed", "Failed listing labeled VirtualServices for cleanup: %v", err)
+		return err
+	}
 
 	for _, item := range vsList.Items {
 		targets[joinKey(item.GetNamespace(), item.GetName())] = struct{}{}
@@ -908,14 +1184,33 @@ func (r *FaultInjectionReconciler) cleanupAll(ctx context.Context, fi *chaosv1al
 
 		labels := vs.GetLabels()
 		if labels != nil && labels["managed-by"] == "fi-operator" && labels["chaos.sghaida.io/fi"] == fi.Name {
-			_ = r.Delete(ctx, vs)
+			if err := r.Delete(ctx, vs); err != nil && !apierrors.IsNotFound(err) {
+				r.Recorder.Eventf(
+					fi, "Warning", "VirtualServiceDeleteFailed",
+					"Failed deleting managed VirtualService %s/%s: %v", ns, name, err,
+				)
+				// continue best-effort
+			} else {
+				r.Recorder.Eventf(
+					fi, "Normal", "VirtualServiceDeleted",
+					"Deleted managed VirtualService %s/%s", ns, name,
+				)
+			}
 			continue
 		}
 
 		if changed {
 			if err := r.Update(ctx, vs); err != nil {
+				r.Recorder.Eventf(
+					fi, "Warning", "CleanupUpdateFailed",
+					"Failed updating VirtualService during cleanup %s/%s: %v", ns, name, err,
+				)
 				return err
 			}
+			r.Recorder.Eventf(
+				fi, "Normal", "RulesRemoved",
+				"Removed injected rules from VirtualService %s/%s", ns, name,
+			)
 		}
 	}
 
@@ -934,11 +1229,12 @@ func (r *FaultInjectionReconciler) cleanupFIManagedDeployments(ctx context.Conte
 	var depList unstructured.UnstructuredList
 	depList.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "DeploymentList"})
 
-	// IMPORTANT (update):
+	// IMPORTANT:
 	// Only delete Deployments that are *marked as* kind:FaultInjection via ownerReferences.
 	// We additionally match on the owning FI name and UID to avoid deleting Deployments
 	// owned by other FaultInjection objects in the same namespace.
 	if err := r.List(ctx, &depList, client.InNamespace(fi.Namespace)); err != nil {
+		r.Recorder.Eventf(fi, "Warning", "DeploymentListFailed", "Failed listing Deployments for cleanup: %v", err)
 		return err
 	}
 
@@ -953,7 +1249,6 @@ func (r *FaultInjectionReconciler) cleanupFIManagedDeployments(ctx context.Conte
 			if o.Kind != "FaultInjection" {
 				continue
 			}
-
 			// Be strict: match both name and UID when available.
 			if o.Name == fi.Name {
 				if fi.UID == "" || string(o.UID) == "" || o.UID == fi.UID {
@@ -968,7 +1263,18 @@ func (r *FaultInjectionReconciler) cleanupFIManagedDeployments(ctx context.Conte
 		}
 
 		dep := item.DeepCopy()
-		_ = r.Delete(ctx, dep) // best-effort
+		if err := r.Delete(ctx, dep); err != nil && !apierrors.IsNotFound(err) {
+			r.Recorder.Eventf(
+				fi, "Warning", "DeploymentDeleteFailed",
+				"Failed deleting FI-owned Deployment %s/%s: %v", dep.GetNamespace(), dep.GetName(), err,
+			)
+			continue
+		}
+
+		r.Recorder.Eventf(
+			fi, "Normal", "DeploymentDeleted",
+			"Deleted FI-owned Deployment %s/%s", dep.GetNamespace(), dep.GetName(),
+		)
 	}
 
 	return nil
@@ -1010,12 +1316,14 @@ func (r *FaultInjectionReconciler) cleanupOrphanedManagedVS(ctx context.Context,
 		if err := r.Delete(ctx, item); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
+		r.Recorder.Eventf(
+			fi, "Normal", "OrphanVirtualServiceDeleted",
+			"Deleted orphaned managed VirtualService %s/%s", item.GetNamespace(), item.GetName(),
+		)
 	}
 
 	return nil
 }
-
-// --- naming + misc (unchanged) ---
 
 // fiRuleNamePrefix returns the prefix used to identify all injected HTTP rules
 // for the given FaultInjection.
@@ -1031,7 +1339,12 @@ func fiRuleNamePrefix(fi *chaosv1alpha1.FaultInjection) string {
 // Names are normalized to match Kubernetes/Istio naming constraints and to remain stable
 // across reconciles.
 func injectedRuleName(fi *chaosv1alpha1.FaultInjection, a *chaosv1alpha1.MeshFaultAction) string {
-	return fmt.Sprintf("fi-%s-%s", fi.Name, sanitizeName(a.Name))
+	// Must start with fiRuleNamePrefix(fi) so patchVirtualServiceHTTP can remove it.
+	return fmt.Sprintf("%s%s-%s",
+		fiRuleNamePrefix(fi),
+		strings.ToLower(a.Direction),
+		sanitizeName(a.Name),
+	)
 }
 
 // managedOutboundVSName returns the name of the managed outbound VirtualService for an OUTBOUND action.
