@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -40,7 +40,7 @@ var _ = Describe("FaultInjection Controller", func() {
 		controllerReconciler := &FaultInjectionReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(1024),
+			Recorder: events.NewFakeRecorder(1024),
 		}
 
 		res, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -89,7 +89,7 @@ var _ = Describe("FaultInjection Controller", func() {
 		controllerReconciler := &FaultInjectionReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(1024),
+			Recorder: events.NewFakeRecorder(1024),
 		}
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-outbound", Namespace: ns},
@@ -161,7 +161,7 @@ var _ = Describe("FaultInjection Controller", func() {
 		controllerReconciler := &FaultInjectionReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(1024),
+			Recorder: events.NewFakeRecorder(1024),
 		}
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-noroute", Namespace: ns},
@@ -193,7 +193,7 @@ var _ = Describe("FaultInjection Controller", func() {
 		controllerReconciler := &FaultInjectionReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(1024),
+			Recorder: events.NewFakeRecorder(1024),
 		}
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-bad-percent", Namespace: ns},
@@ -235,7 +235,7 @@ var _ = Describe("FaultInjection Controller", func() {
 		controllerReconciler := &FaultInjectionReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(1024),
+			Recorder: events.NewFakeRecorder(1024),
 		}
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "fi-bad-maxpods", Namespace: ns},
@@ -263,7 +263,7 @@ var _ = Describe("FaultInjection Controller", func() {
 		controllerReconciler := &FaultInjectionReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(1024),
+			Recorder: events.NewFakeRecorder(1024),
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -359,7 +359,7 @@ var _ = Describe("FaultInjection Controller", func() {
 		controllerReconciler := &FaultInjectionReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(1024),
+			Recorder: events.NewFakeRecorder(1024),
 		}
 
 		By("reconciling once to apply faults (create managed VS + inject inbound rule)")
@@ -489,7 +489,7 @@ var _ = Describe("FaultInjection Controller", func() {
 		controllerReconciler := &FaultInjectionReconciler{
 			Client:   k8sClient,
 			Scheme:   k8sClient.Scheme(),
-			Recorder: record.NewFakeRecorder(1024),
+			Recorder: events.NewFakeRecorder(1024),
 		}
 
 		_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -1008,8 +1008,8 @@ func testForceFIStartedAt(ctx context.Context, fi *unstructured.Unstructured, st
 	return k8sClient.Status().Update(ctx, fi)
 }
 
-func testRecorder() record.EventRecorder {
-	return record.NewFakeRecorder(1024)
+func testRecorder() events.EventRecorder {
+	return events.NewFakeRecorder(1024)
 }
 
 func testFIActionInboundAbort(actionName, vsName string, percent int64, httpStatus int64) func(*unstructured.Unstructured) {

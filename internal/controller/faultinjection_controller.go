@@ -66,7 +66,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -117,7 +117,7 @@ type FaultInjectionReconciler struct {
 	Scheme *runtime.Scheme
 
 	// Recorder is an event recorder for emitting Kubernetes events.
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 // Reconcile performs reconciliation for a single FaultInjection resource.
@@ -178,7 +178,7 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		"expiresAt", fi.Status.ExpiresAt,
 	)
 
-	now := time.Now()
+	now := time.Now().UTC()
 
 	lifecycleChanged := r.ensureLifecycle(log, &fi)
 	if lifecycleChanged {
@@ -196,7 +196,8 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return r.Status().Update(ctx, &latest)
 		}); err != nil {
 			log.Error(err, "failed to persist lifecycle status", "name", fi.Name, "ns", fi.Namespace)
-			r.Recorder.Eventf(&fi, "Warning", "StatusUpdateFailed", "Failed to persist lifecycle status: %v", err)
+			r.eventf(&fi, "Warning", "StatusUpdateFailed", "status-update",
+				"Failed to persist lifecycle status: %v", err)
 			return ctrl.Result{}, err
 		}
 
@@ -247,7 +248,7 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	if err := r.cleanupOrphanedManagedVS(ctx, &fi, managedVSNames); err != nil {
 		log.Error(err, "failed cleanupOrphanedManagedVS", "name", fi.Name, "ns", fi.Namespace)
-		r.Recorder.Eventf(&fi, "Warning", "OrphanCleanupFailed", "Failed cleaning orphaned managed VirtualServices: %v", err)
+		r.eventf(&fi, "Warning", "OrphanCleanupFailed", "cleanup-orphans", "Failed cleaning orphaned managed VirtualServices: %v", err)
 	}
 
 	if err := r.markRunning(ctx, log, &fi); err != nil {
@@ -283,8 +284,8 @@ func (r *FaultInjectionReconciler) ensureLifecycle(
 	// Fail-closed guard (admission should prevent this, but keep reconciler resilient).
 	if durSeconds <= 0 {
 		if r.Recorder != nil {
-			r.Recorder.Eventf(
-				fi, "Warning", "InvalidSpec",
+			r.eventf(
+				fi, "Warning", "InvalidSpec", "validate",
 				"blastRadius.durationSeconds must be > 0 (got %d)",
 				durSeconds,
 			)
@@ -300,8 +301,8 @@ func (r *FaultInjectionReconciler) ensureLifecycle(
 		changed = true
 
 		if r.Recorder != nil {
-			r.Recorder.Eventf(
-				fi, "Normal", "Started",
+			r.eventf(
+				fi, "Normal", "Started", "lifecycle-init",
 				"Experiment started; durationSeconds=%d maxTrafficPercent=%d",
 				durSeconds,
 				maxTrafficPercent,
@@ -316,8 +317,8 @@ func (r *FaultInjectionReconciler) ensureLifecycle(
 	// Safety net (should never happen).
 	if fi.Status.StartedAt == nil {
 		if r.Recorder != nil {
-			r.Recorder.Eventf(
-				fi, "Warning", "LifecycleError",
+			r.eventf(
+				fi, "Warning", "LifecycleError", "lifecycle-init",
 				"internal error: StartedAt is nil after initialization",
 			)
 		}
@@ -335,8 +336,8 @@ func (r *FaultInjectionReconciler) ensureLifecycle(
 		changed = true
 
 		if r.Recorder != nil {
-			r.Recorder.Eventf(
-				fi, "Normal", "LifecycleUpdated",
+			r.eventf(
+				fi, "Normal", "LifecycleUpdated", "lifecycle-update",
 				"Lifecycle set; startedAt=%s expiresAt=%s",
 				fi.Status.StartedAt.Format(time.RFC3339),
 				t.Format(time.RFC3339),
@@ -376,15 +377,15 @@ func (r *FaultInjectionReconciler) handleCancellation(ctx context.Context, log l
 	}
 
 	if fi.Status.CancelledAt == nil {
-		r.Recorder.Event(fi, "Normal", "CancelRequested", "Cancellation requested via spec.cancel=true")
+		r.event(fi, "Normal", "CancelRequested", "cancel", "Cancellation requested via spec.cancel=true")
 	}
 
 	log.Info("experiment cancellation requested; starting cleanup", "name", fi.Name, "ns", fi.Namespace)
-	r.Recorder.Event(fi, "Normal", "CleanupStarted", "Starting cleanup for cancelled experiment")
+	r.event(fi, "Normal", "CleanupStarted", "cleanup", "Starting cleanup for cancelled experiment")
 
 	if err := r.cleanupAll(ctx, fi); err != nil {
 		log.Error(err, "cancellation cleanup failed", "name", fi.Name, "ns", fi.Namespace)
-		r.Recorder.Eventf(fi, "Warning", "CleanupFailed", "Cancellation cleanup failed: %v", err)
+		r.eventf(fi, "Warning", "CleanupFailed", "cleanup", "Cancellation cleanup failed: %v", err)
 		return ctrl.Result{}, err
 	}
 
@@ -408,11 +409,11 @@ func (r *FaultInjectionReconciler) handleCancellation(ctx context.Context, log l
 		return r.Status().Update(ctx, &latest)
 	}); err != nil {
 		log.Error(err, "failed to persist Cancelled status after cancellation", "name", fi.Name, "ns", fi.Namespace)
-		r.Recorder.Eventf(fi, "Warning", "StatusUpdateFailed", "Failed to persist Cancelled status: %v", err)
+		r.eventf(fi, "Warning", "StatusUpdateFailed", "status-update", "Failed to persist Cancelled status: %v", err)
 		return ctrl.Result{}, err
 	}
 
-	r.Recorder.Event(fi, "Normal", "Cancelled", "Experiment cancelled; cleanup completed")
+	r.event(fi, "Normal", "Cancelled", "cancel", "Experiment cancelled; cleanup completed")
 	log.Info("experiment cancelled; cleanup completed", "name", fi.Name, "ns", fi.Namespace)
 	return ctrl.Result{}, nil
 }
@@ -434,11 +435,11 @@ func (r *FaultInjectionReconciler) handleCancellation(ctx context.Context, log l
 //   - Returns an error if cleanupAll fails or the status update fails.
 func (r *FaultInjectionReconciler) handleExpiry(ctx context.Context, log logr.Logger, fi *chaosv1alpha1.FaultInjection) (ctrl.Result, error) {
 	log.Info("experiment expired; starting cleanup", "name", fi.Name, "ns", fi.Namespace, "expiresAt", fi.Status.ExpiresAt.Time)
-	r.Recorder.Event(fi, "Normal", "CleanupStarted", "Starting cleanup for expired experiment")
+	r.event(fi, "Normal", "CleanupStarted", "cleanup", "Starting cleanup for expired experiment")
 
 	if err := r.cleanupAll(ctx, fi); err != nil {
 		log.Error(err, "expiry cleanup failed", "name", fi.Name, "ns", fi.Namespace)
-		r.Recorder.Eventf(fi, "Warning", "CleanupFailed", "Expiry cleanup failed: %v", err)
+		r.eventf(fi, "Warning", "CleanupFailed", "cleanup", "Expiry cleanup failed: %v", err)
 		return ctrl.Result{}, err
 	}
 
@@ -447,11 +448,12 @@ func (r *FaultInjectionReconciler) handleExpiry(ctx context.Context, log logr.Lo
 
 	if err := r.Status().Update(ctx, fi); err != nil {
 		log.Error(err, "failed to persist Completed status after expiry", "name", fi.Name, "ns", fi.Namespace)
-		r.Recorder.Eventf(fi, "Warning", "StatusUpdateFailed", "Failed to persist Completed status after expiry: %v", err)
+		r.eventf(fi, "Warning", "StatusUpdateFailed", "status-update", "Failed to persist Completed status after expiry: %v", err)
+
 		return ctrl.Result{}, err
 	}
 
-	r.Recorder.Event(fi, "Normal", "Expired", "Experiment expired; cleanup completed")
+	r.event(fi, "Normal", "Expired", "expiry", "Experiment expired; cleanup completed")
 	log.Info("experiment expired; cleanup completed", "name", fi.Name, "ns", fi.Namespace)
 	return ctrl.Result{}, nil
 }
@@ -494,12 +496,12 @@ func (r *FaultInjectionReconciler) handleExpiry(ctx context.Context, log logr.Lo
 //   - Reconciliation stops after this handler; no requeue is scheduled.
 func (r *FaultInjectionReconciler) handleValidationError(ctx context.Context, log logr.Logger, fi *chaosv1alpha1.FaultInjection, verr error) (ctrl.Result, error) {
 	log.Error(verr, "spec validation failed; starting cleanup", "name", fi.Name, "ns", fi.Namespace)
-	r.Recorder.Eventf(fi, "Warning", "ValidationFailed", "Spec rejected: %v", verr)
-	r.Recorder.Event(fi, "Normal", "CleanupStarted", "Starting cleanup after spec validation failure")
+	r.eventf(fi, "Warning", "ValidationFailed", "validate", "Spec rejected: %v", verr)
+	r.event(fi, "Normal", "CleanupStarted", "cleanup", "Starting cleanup after spec validation failure")
 
 	if cerr := r.cleanupAll(ctx, fi); cerr != nil {
 		log.Error(cerr, "cleanup after validation failure failed", "name", fi.Name, "ns", fi.Namespace)
-		r.Recorder.Eventf(fi, "Warning", "CleanupFailed", "Cleanup after validation failure failed: %v", cerr)
+		r.eventf(fi, "Warning", "CleanupFailed", "cleanup", "Cleanup after validation failure failed: %v", cerr)
 	}
 
 	fi.Status.Phase = ErrorPhase
@@ -507,7 +509,7 @@ func (r *FaultInjectionReconciler) handleValidationError(ctx context.Context, lo
 
 	if err := r.Status().Update(ctx, fi); err != nil {
 		log.Error(err, "failed to persist Error status after validation failure", "name", fi.Name, "ns", fi.Namespace)
-		r.Recorder.Eventf(fi, "Warning", "StatusUpdateFailed", "Failed to persist Error status after validation failure: %v", err)
+		r.eventf(fi, "Warning", "StatusUpdateFailed", "status-update", "Failed to persist Error status after validation failure: %v", err)
 		return ctrl.Result{}, err
 	}
 
@@ -550,7 +552,7 @@ func (r *FaultInjectionReconciler) applyDesiredTargets(
 		vs, created, err := r.getOrCreateVirtualService(ctx, fi, vsNS, vsName, desired)
 		if err != nil {
 			log.Error(err, "failed getting/creating VirtualService", "fi", fi.Name, "vsNS", vsNS, "vsName", vsName)
-			r.Recorder.Eventf(fi, "Warning", "VirtualServiceGetOrCreateFailed", "Failed getting/creating VirtualService %s/%s: %v", vsNS, vsName, err)
+			r.eventf(fi, "Warning", "VirtualServiceGetOrCreateFailed", "vs-get-or-create", "Failed getting/creating VirtualService %s/%s: %v", vsNS, vsName, err)
 
 			fi.Status.Phase = ErrorPhase
 			fi.Status.Message = fmt.Sprintf("failed getting/creating VirtualService %s/%s: %v", vsNS, vsName, err)
@@ -566,7 +568,7 @@ func (r *FaultInjectionReconciler) applyDesiredTargets(
 				baseRoute = buildManagedOutboundDefaultRoute(desired.Hosts)
 				ensureVSHasAtLeastOneDefaultRouteRule(vs, desired.Hosts)
 
-				r.Recorder.Eventf(fi, "Normal", "DefaultRouteEnsured", "Ensured default route for managed VirtualService %s/%s (hosts=%v)", vsNS, vsName, desired.Hosts)
+				r.eventf(fi, "Normal", "DefaultRouteEnsured", "vs-default-route", "Ensured default route for managed VirtualService %s/%s (hosts=%v)", vsNS, vsName, desired.Hosts)
 			} else {
 				fi.Status.Phase = ErrorPhase
 				fi.Status.Message = fmt.Sprintf(
@@ -574,7 +576,7 @@ func (r *FaultInjectionReconciler) applyDesiredTargets(
 					vsNS, vsName,
 				)
 
-				r.Recorder.Eventf(fi, "Warning", "UnsafeTarget", "Target VirtualService %s/%s has no route/redirect/direct_response; cannot inject faults safely", vsNS, vsName)
+				r.eventf(fi, "Warning", "UnsafeTarget", "vs-unsafe-target", "Target VirtualService %s/%s has no route/redirect/direct_response; cannot inject faults safely", vsNS, vsName)
 				_ = r.Status().Update(ctx, fi)
 
 				// IMPORTANT: stop reconciliation so markRunning does not overwrite Error.
@@ -593,14 +595,14 @@ func (r *FaultInjectionReconciler) applyDesiredTargets(
 
 		if created || changed || meshGatewayChanged {
 			if err := r.Update(ctx, vs); err != nil {
-				r.Recorder.Eventf(fi, "Warning", "VirtualServiceUpdateFailed", "Failed updating VirtualService %s/%s: %v", vsNS, vsName, err)
+				r.eventf(fi, "Warning", "VirtualServiceUpdateFailed", "vs-update", "Failed updating VirtualService %s/%s: %v", vsNS, vsName, err)
 				return false, err
 			}
 
 			if created {
-				r.Recorder.Eventf(fi, "Normal", "VirtualServiceCreated", "Created managed VirtualService %s/%s", vsNS, vsName)
+				r.eventf(fi, "Normal", "VirtualServiceCreated", "vs-create", "Created managed VirtualService %s/%s", vsNS, vsName)
 			} else if changed || meshGatewayChanged {
-				r.Recorder.Eventf(fi, "Normal", "VirtualServicePatched", "Patched VirtualService %s/%s (injected rules updated)", vsNS, vsName)
+				r.eventf(fi, "Normal", "VirtualServicePatched", "vs-patch", "Patched VirtualService %s/%s (injected rules updated)", vsNS, vsName)
 			}
 		}
 	}
@@ -629,13 +631,14 @@ func (r *FaultInjectionReconciler) markRunning(ctx context.Context, log logr.Log
 	fi.Status.Message = "Active: injected rules are applied"
 
 	if !wasRunning {
-		r.Recorder.Event(fi, "Normal", "Active", "Experiment is active; injected rules are applied")
+		r.event(fi, "Normal", "Active", "mark-running", "Experiment is active; injected rules are applied")
 		log.Info("experiment is active", "name", fi.Name, "ns", fi.Namespace, "expiresAt", fi.Status.ExpiresAt.Time)
 	}
 
 	if err := r.Status().Update(ctx, fi); err != nil {
 		log.Error(err, "failed to persist Running status", "name", fi.Name, "ns", fi.Namespace)
-		r.Recorder.Eventf(fi, "Warning", "StatusUpdateFailed", "Failed to persist FaultInjection status: %v", err)
+		r.eventf(fi, "Warning", "StatusUpdateFailed", "status-update", "Failed to persist FaultInjection status: %v", err)
+
 		return err
 	}
 
@@ -650,7 +653,7 @@ func (r *FaultInjectionReconciler) markRunning(ctx context.Context, log logr.Log
 // The controller name is set to "faultinjection".
 func (r *FaultInjectionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
-		r.Recorder = mgr.GetEventRecorderFor("faultinjection-controller")
+		r.Recorder = mgr.GetEventRecorder("faultinjection-controller")
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -1221,7 +1224,7 @@ func (r *FaultInjectionReconciler) cleanupAll(ctx context.Context, fi *chaosv1al
 	var vsList unstructured.UnstructuredList
 	vsList.SetGroupVersionKind(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1beta1", Kind: "VirtualServiceList"})
 	if err := r.List(ctx, &vsList, client.InNamespace(fi.Namespace), client.MatchingLabels{"chaos.sghaida.io/fi": fi.Name}); err != nil {
-		r.Recorder.Eventf(fi, "Warning", "CleanupListFailed", "Failed listing labeled VirtualServices for cleanup: %v", err)
+		r.eventf(fi, "Warning", "CleanupListFailed", "cleanup", "Failed listing labeled VirtualServices for cleanup: %v", err)
 		return err
 	}
 
@@ -1248,14 +1251,14 @@ func (r *FaultInjectionReconciler) cleanupAll(ctx context.Context, fi *chaosv1al
 		labels := vs.GetLabels()
 		if labels != nil && labels["managed-by"] == "fi-operator" && labels["chaos.sghaida.io/fi"] == fi.Name {
 			if err := r.Delete(ctx, vs); err != nil && !apierrors.IsNotFound(err) {
-				r.Recorder.Eventf(
-					fi, "Warning", "VirtualServiceDeleteFailed",
+				r.eventf(
+					fi, "Warning", "VirtualServiceDeleteFailed", "vs-delete",
 					"Failed deleting managed VirtualService %s/%s: %v", ns, name, err,
 				)
 				// continue best-effort
 			} else {
-				r.Recorder.Eventf(
-					fi, "Normal", "VirtualServiceDeleted",
+				r.eventf(
+					fi, "Normal", "VirtualServiceDeleted", "vs-delete",
 					"Deleted managed VirtualService %s/%s", ns, name,
 				)
 			}
@@ -1264,14 +1267,14 @@ func (r *FaultInjectionReconciler) cleanupAll(ctx context.Context, fi *chaosv1al
 
 		if changed {
 			if err := r.Update(ctx, vs); err != nil {
-				r.Recorder.Eventf(
-					fi, "Warning", "CleanupUpdateFailed",
+				r.eventf(
+					fi, "Warning", "CleanupUpdateFailed", "vs-update",
 					"Failed updating VirtualService during cleanup %s/%s: %v", ns, name, err,
 				)
 				return err
 			}
-			r.Recorder.Eventf(
-				fi, "Normal", "RulesRemoved",
+			r.eventf(
+				fi, "Normal", "RulesRemoved", "cleanup",
 				"Removed injected rules from VirtualService %s/%s", ns, name,
 			)
 		}
@@ -1297,7 +1300,7 @@ func (r *FaultInjectionReconciler) cleanupFIManagedDeployments(ctx context.Conte
 	// We additionally match on the owning FI name and UID to avoid deleting Deployments
 	// owned by other FaultInjection objects in the same namespace.
 	if err := r.List(ctx, &depList, client.InNamespace(fi.Namespace)); err != nil {
-		r.Recorder.Eventf(fi, "Warning", "DeploymentListFailed", "Failed listing Deployments for cleanup: %v", err)
+		r.eventf(fi, "Warning", "DeploymentListFailed", "dep-list", "Failed listing Deployments for cleanup: %v", err)
 		return err
 	}
 
@@ -1327,15 +1330,15 @@ func (r *FaultInjectionReconciler) cleanupFIManagedDeployments(ctx context.Conte
 
 		dep := item.DeepCopy()
 		if err := r.Delete(ctx, dep); err != nil && !apierrors.IsNotFound(err) {
-			r.Recorder.Eventf(
-				fi, "Warning", "DeploymentDeleteFailed",
+			r.eventf(
+				fi, "Warning", "DeploymentDeleteFailed", "dep-delete",
 				"Failed deleting FI-owned Deployment %s/%s: %v", dep.GetNamespace(), dep.GetName(), err,
 			)
 			continue
 		}
 
-		r.Recorder.Eventf(
-			fi, "Normal", "DeploymentDeleted",
+		r.eventf(
+			fi, "Normal", "DeploymentDeleted", "dep-delete",
 			"Deleted FI-owned Deployment %s/%s", dep.GetNamespace(), dep.GetName(),
 		)
 	}
@@ -1379,8 +1382,8 @@ func (r *FaultInjectionReconciler) cleanupOrphanedManagedVS(ctx context.Context,
 		if err := r.Delete(ctx, item); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
-		r.Recorder.Eventf(
-			fi, "Normal", "OrphanVirtualServiceDeleted",
+		r.eventf(
+			fi, "Normal", "OrphanVirtualServiceDeleted", "cleanup-orphans",
 			"Deleted orphaned managed VirtualService %s/%s", item.GetNamespace(), item.GetName(),
 		)
 	}
@@ -1516,4 +1519,27 @@ func cloneMap(in map[string]any) map[string]any {
 	out := make(map[string]any, len(in))
 	maps.Copy(out, in)
 	return out
+}
+
+//nolint:unparam // eventType kept for future extensibility ("Normal"/"Warning")
+func (r *FaultInjectionReconciler) event(
+	regarding runtime.Object,
+	eventType, reason, action, note string,
+) {
+	if r.Recorder == nil {
+		return
+	}
+	// new events API: (regarding, related, type, reason, action, noteFmt, ...)
+	r.Recorder.Eventf(regarding, nil, eventType, reason, action, "%s", note)
+}
+
+func (r *FaultInjectionReconciler) eventf(
+	regarding runtime.Object,
+	eventType, reason, action, noteFmt string,
+	args ...any,
+) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(regarding, nil, eventType, reason, action, noteFmt, args...)
 }
