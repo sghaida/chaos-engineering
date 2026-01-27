@@ -624,22 +624,92 @@ func (r *FaultInjectionReconciler) applyDesiredTargets(
 //
 //   - Returns nil if status persistence succeeds.
 //   - Returns an error if the status update fails.
-func (r *FaultInjectionReconciler) markRunning(ctx context.Context, log logr.Logger, fi *chaosv1alpha1.FaultInjection) error {
-	wasRunning := fi.Status.Phase == RunningPhase
+func (r *FaultInjectionReconciler) markRunning(
+	ctx context.Context,
+	log logr.Logger,
+	fi *chaosv1alpha1.FaultInjection,
+) error {
 
-	fi.Status.Phase = RunningPhase
-	fi.Status.Message = "Active: injected rules are applied"
-
-	if !wasRunning {
-		r.event(fi, "Normal", "Active", "mark-running", "Experiment is active; injected rules are applied")
-		log.Info("experiment is active", "name", fi.Name, "ns", fi.Namespace, "expiresAt", fi.Status.ExpiresAt.Time)
+	// Fast path: if this reconcile already sees Running, do nothing.
+	// This avoids unnecessary writes and conflict retries.
+	if fi.Status.Phase == RunningPhase {
+		return nil
 	}
 
-	if err := r.Status().Update(ctx, fi); err != nil {
-		log.Error(err, "failed to persist Running status", "name", fi.Name, "ns", fi.Namespace)
-		r.eventf(fi, "Warning", "StatusUpdateFailed", "status-update", "Failed to persist FaultInjection status: %v", err)
+	key := client.ObjectKeyFromObject(fi)
 
+	// We only want to emit the "Active" event if THIS call
+	// actually transitions the object into Running.
+	emitActiveEvent := false
+
+	// Status updates are subject to optimistic locking (resourceVersion).
+	// RetryOnConflict ensures we re-fetch and re-apply on conflict.
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest chaosv1alpha1.FaultInjection
+
+		// Always operate on the latest version from the API server.
+		if err := r.Get(ctx, key, &latest); err != nil {
+			return err
+		}
+
+		// Another reconcile may have already marked it Running.
+		// In that case, do nothing and exit successfully.
+		if latest.Status.Phase == RunningPhase {
+			return nil
+		}
+
+		// Transition to Running.
+		latest.Status.Phase = RunningPhase
+		latest.Status.Message = "Active: injected rules are applied"
+
+		// Mark that we should emit the Active event *after*
+		// the status update succeeds.
+		emitActiveEvent = true
+
+		// Persist only the status subresource.
+		return r.Status().Update(ctx, &latest)
+	})
+
+	if err != nil {
+		// Conflict retries exhausted or a real API error occurred.
+		log.Error(err, "failed to persist Running status", "name", fi.Name, "ns", fi.Namespace)
+
+		r.eventf(
+			fi,
+			"Warning",
+			"StatusUpdateFailed",
+			"status-update",
+			"Failed to persist FaultInjection status: %v",
+			err,
+		)
 		return err
+	}
+
+	// Emit event and log only if THIS reconcile caused the transition.
+	if emitActiveEvent {
+		r.event(
+			fi,
+			"Normal",
+			"Active",
+			"mark-running",
+			"Experiment is active; injected rules are applied",
+		)
+
+		// Log with expiresAt when available (defensive against nil).
+		if fi.Status.ExpiresAt != nil {
+			log.Info(
+				"experiment is active",
+				"name", fi.Name,
+				"ns", fi.Namespace,
+				"expiresAt", fi.Status.ExpiresAt.Time,
+			)
+		} else {
+			log.Info(
+				"experiment is active",
+				"name", fi.Name,
+				"ns", fi.Namespace,
+			)
+		}
 	}
 
 	return nil
