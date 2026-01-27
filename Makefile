@@ -287,3 +287,10 @@ fi-cancel-test: ensure-and-clean ## Run FaultInjection cancellation test in the 
 	FI_NAME="$(FI_NAME)" \
 	FI_RULE_PREFIX="$(FI_RULE_PREFIX)" \
 	"$(FI_SCRIPTS_DIR)/cancelation-test.sh"
+
+.PHONY: fi-experiment-test
+fi-experiment-test: ensure-and-clean ## Run FaultInjection experiment test in the demo namespace
+	@echo ">> Running FaultInjection experiment test (ns=$(FI_NS), fi=$(FI_NAME))"
+	NS="$(FI_NS)" \
+	FI_NAME="$(FI_NAME)" \
+	"$(FI_SCRIPTS_DIR)/experment-test.sh"
