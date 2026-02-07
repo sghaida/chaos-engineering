@@ -40,6 +40,49 @@ const (
 // Cross-field validation:
 // - FORCEFUL requires gracePeriodSeconds == 0
 // - GRACEFUL requires gracePeriodSeconds > 0
+// PodFaultAction defines how a pod-level fault is applied to Kubernetes workloads.
+//
+// Semantics:
+//
+// - type=POD_DELETE:
+//   - Deletes selected pods in the target (graceful or forceful).
+//   - The controller MUST record the impacted pod names in status and emit events for auditability.
+//
+// Defaulting:
+//
+// - policy.executionMode defaults to ONE_SHOT.
+// - target.namespace defaults to the FaultInjection namespace (controller-enforced) when omitted.
+// - guardrails.refuseIfPodsLessThan defaults to 1.
+// - guardrails.respectPodDisruptionBudget defaults to true.
+//
+// Admission policy (cross-field invariants; enforced by CRD validation, admission webhook, or controller):
+//
+// - Termination mode and grace period:
+//   - When termination.mode=FORCEFUL:
+//   - termination.gracePeriodSeconds MUST be 0
+//   - When termination.mode=GRACEFUL:
+//   - termination.gracePeriodSeconds MUST be > 0
+//
+// - Execution mode and window:
+//   - When policy.executionMode=WINDOWED:
+//   - window is required
+//   - When policy.executionMode=ONE_SHOT (or policy omitted):
+//   - window MUST be omitted
+//
+// - Pod selection mode:
+//   - When selection.mode=COUNT:
+//   - selection.count is required
+//   - selection.percent MUST be omitted
+//   - When selection.mode=PERCENT:
+//   - selection.percent is required (1..100)
+//   - selection.count MUST be omitted
+//
+// Safety expectations:
+//
+//   - guardrails are mandatory.
+//   - selection.maxPodsAffected (if set) acts as an additional per-action cap and is still bounded by
+//     spec.blastRadius.maxPodsAffected (if the parent FaultInjection defines it).
+//
 // +kubebuilder:validation:XValidation:rule="(self.termination.mode == 'FORCEFUL' && self.termination.gracePeriodSeconds == 0) || (self.termination.mode == 'GRACEFUL' && self.termination.gracePeriodSeconds > 0)",message="termination.gracePeriodSeconds must be 0 for FORCEFUL and >0 for GRACEFUL"
 // - WINDOWED requires window to be set; ONE_SHOT forbids window
 // +kubebuilder:validation:XValidation:rule="((has(self.policy) && self.policy.executionMode == 'WINDOWED') && has(self.window)) || ((!has(self.policy) || self.policy.executionMode == 'ONE_SHOT') && !has(self.window))",message="window must be set when executionMode=WINDOWED and must be omitted when executionMode=ONE_SHOT"
@@ -112,6 +155,10 @@ type PodTargetSpec struct {
 }
 
 // PodSelectionSpec defines the number of pods to affect.
+// - mode=COUNT requires count and forbids percent
+// - mode=PERCENT requires percent and forbids count
+//
+// percent is bounded to 1..100.
 // +kubebuilder:validation:XValidation:rule="(self.mode == 'COUNT' && has(self.count) && !has(self.percent)) || (self.mode == 'PERCENT' && has(self.percent) && !has(self.count))",message="set exactly one of selection.count or selection.percent based on selection.mode"
 type PodSelectionSpec struct {
 	// Mode selects count-based or percent-based selection.
@@ -135,7 +182,12 @@ type PodSelectionSpec struct {
 	MaxPodsAffected *int32 `json:"maxPodsAffected,omitempty"`
 }
 
-// PodTerminationSpec defines termination semantics.
+// PodTerminationSpec defines graceful vs forceful deletion semantics.
+//
+// Invariants are enforced on PodFaultAction:
+//
+// - mode=FORCEFUL requires gracePeriodSeconds=0
+// - mode=GRACEFUL requires gracePeriodSeconds>0
 type PodTerminationSpec struct {
 	// Mode selects graceful vs forceful termination.
 	// +kubebuilder:validation:Enum=GRACEFUL;FORCEFUL
