@@ -363,6 +363,10 @@ type FaultInjectionStatus struct {
 	// Rules captures per-rule evaluation state (interval scheduling + debouncing).
 	// +optional
 	Rules []StopRuleStatus `json:"rules,omitempty"`
+
+	// PodFaults records per-action pod fault execution state.
+	// +optional
+	PodFaults []PodFaultTickStatus `json:"podFaults,omitempty"`
 }
 
 // StopRuleStatus stores per-rule evaluation state.

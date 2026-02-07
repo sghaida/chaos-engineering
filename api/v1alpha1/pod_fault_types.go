@@ -1,5 +1,7 @@
 package v1alpha1
 
+import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 // PodFaultActionType is the type discriminator for pod-level actions.
 type PodFaultActionType string
 
@@ -25,7 +27,7 @@ const (
 	// PodSelectionModeCount Count of Impacted pods for Pod fault
 	PodSelectionModeCount PodSelectionMode = "COUNT"
 
-	// PodSelectionModePercent Percenatge of impacted pods for Pod fault
+	// PodSelectionModePercent Percentage of impacted pods for Pod fault
 	PodSelectionModePercent PodSelectionMode = "PERCENT"
 
 	// PodTerminationModeGraceful Graceful option for killing pods
@@ -213,4 +215,38 @@ type PodGuardrailsSpec struct {
 	// +kubebuilder:default:=true
 	// +optional
 	RespectPodDisruptionBudget bool `json:"respectPodDisruptionBudget,omitempty"`
+}
+
+// PodFaultTickStatus records per-action, per-tick execution state for pod faults.
+// controller will use it to record affected pod names in status (planned/executed)
+type PodFaultTickStatus struct {
+	// ActionName is the pod fault action name from spec.actions.podFaults[].name.
+	ActionName string `json:"actionName"`
+
+	// TickID is "oneshot" or a window tick number string ("0","1",...).
+	TickID string `json:"tickId"`
+
+	// PlannedAt is when the controller selected target pods for this tick.
+	// +optional
+	PlannedAt *metav1.Time `json:"plannedAt,omitempty"`
+
+	// PlannedPods are the exact pod names selected by the controller for this tick.
+	// +optional
+	PlannedPods []string `json:"plannedPods,omitempty"`
+
+	// JobName is the executor Job name created for this tick.
+	// +optional
+	JobName string `json:"jobName,omitempty"`
+
+	// ExecutedAt is when the controller observed completion/failure of the executor job.
+	// +optional
+	ExecutedAt *metav1.Time `json:"executedAt,omitempty"`
+
+	// State is one of: Planned, Running, Succeeded, Failed.
+	// +optional
+	State string `json:"state,omitempty"`
+
+	// Message provides additional context (error, completion note).
+	// +optional
+	Message string `json:"message,omitempty"`
 }
