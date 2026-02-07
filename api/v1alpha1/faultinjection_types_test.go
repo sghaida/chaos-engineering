@@ -181,4 +181,101 @@ var _ = Describe("FaultInjection API types", func() {
 		Expect(round.Spec.Actions.MeshFaults).To(HaveLen(1))
 		Expect(round.Spec.Actions.MeshFaults[0].Name).To(Equal("inbound-latency"))
 	})
+
+	Describe("enum stability", func() {
+
+		It("should have stable pod fault enums", func() {
+			values := []string{
+				string(PodFaultActionTypePodDelete),
+
+				string(ExecutionModeOneShot),
+				string(ExecutionModeWindowed),
+
+				string(PodSelectionModeCount),
+				string(PodSelectionModePercent),
+
+				string(PodTerminationModeGraceful),
+				string(PodTerminationModeForceful),
+			}
+
+			expectNonEmptyUnique(values)
+		})
+
+		It("should have stable mesh fault enums", func() {
+			values := []string{
+				// Direction
+				"INBOUND",
+				"OUTBOUND",
+
+				// Type
+				"HTTP_LATENCY",
+				"HTTP_ABORT",
+			}
+
+			expectNonEmptyUnique(values)
+		})
+
+		It("should have stable metric enums", func() {
+			values := []string{
+				// Metric types
+				"counter",
+				"histogram",
+				"summary",
+
+				// Query kinds
+				"rate",
+				"count",
+				"quantile",
+
+				// Aggregations
+				"sum",
+				"avg",
+				"max",
+				"min",
+
+				// Comparators
+				"GT",
+				"GTE",
+				"LT",
+				"LTE",
+				"EQ",
+				"NEQ",
+			}
+
+			expectNonEmptyUnique(values)
+		})
+	})
+
+	Describe("JSON serialization", func() {
+
+		It("should round-trip pod fault enums through JSON", func() {
+			type payload struct {
+				Type PodFaultActionType `json:"type"`
+				Mode ExecutionMode      `json:"mode"`
+			}
+
+			in := payload{
+				Type: PodFaultActionTypePodDelete,
+				Mode: ExecutionModeOneShot,
+			}
+
+			data, err := json.Marshal(in)
+			Expect(err).NotTo(HaveOccurred())
+
+			var out payload
+			Expect(json.Unmarshal(data, &out)).To(Succeed())
+			Expect(out).To(Equal(in))
+		})
+	})
+
 })
+
+func expectNonEmptyUnique(values []string) {
+	seen := map[string]struct{}{}
+	for i, v := range values {
+		Expect(v).NotTo(BeEmpty(), "enum[%d] must not be empty", i)
+		_, exists := seen[v]
+		Expect(exists).To(BeFalse(), "duplicate enum value: %q", v)
+		seen[v] = struct{}{}
+	}
+}
