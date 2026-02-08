@@ -22,7 +22,7 @@ type FaultInjectionSpec struct {
 	BlastRadius BlastRadiusSpec `json:"blastRadius"`
 
 	// Actions defines the concrete chaos actions to execute.
-	// At least one mesh fault must be specified.
+	// At least one of meshFaults or podFaults must be specified.
 	// +kubebuilder:validation:Required
 	Actions ActionsSpec `json:"actions"`
 
@@ -95,11 +95,17 @@ type BlastRadiusSpec struct {
 
 // ActionsSpec groups all chaos actions associated with a FaultInjection.
 // Each action is executed independently.
+// +kubebuilder:validation:XValidation:rule="(has(self.meshFaults) && size(self.meshFaults) > 0) || (has(self.podFaults) && size(self.podFaults) > 0)",message="at least one of actions.meshFaults or actions.podFaults must be specified"
 type ActionsSpec struct {
 	// MeshFaults defines Istio-based HTTP fault injections.
 	// Each entry is executed independently.
-	// +kubebuilder:validation:MinItems=1
-	MeshFaults []MeshFaultAction `json:"meshFaults"`
+	// +optional
+	MeshFaults []MeshFaultAction `json:"meshFaults,omitempty"`
+
+	// PodFaults defines pod-level faults (bounded and time-boxed).
+	// Each entry is executed independently.
+	// +optional
+	PodFaults []PodFaultAction `json:"podFaults,omitempty"`
 }
 
 // StopConditionsSpec defines automatic kill-switch criteria for a FaultInjection experiment.
@@ -284,345 +290,12 @@ type StopRule struct {
 	Compare MetricCompare `json:"compare"`
 }
 
-// StructuredQuery defines a label-agnostic metric query builder.
-//
-// This is designed to work across organizations and metric conventions:
-// - metric names are arbitrary Prometheus metric names (service metrics, Istio, Envoy, etc.)
-// - labels are dynamic key/value selectors, with optional regex matching
-// - only counter, histogram, and summary metric types are supported
-// - query methods are limited to rate, count, and quantile
-// - optional groupBy dimensions allow per-entity evaluation (e.g., per-pod)
-//
-// The controller MUST translate this structured definition into valid PromQL
-// during rule evaluation.
-//
-// Admission policy:
-// - Metric.name must be non-empty.
-// - Metric.type must be one of counter|histogram|summary.
-// - Query.kind must be one of rate|count|quantile.
-// - Query.kind must be compatible with Metric.type:
-//   - counter -> rate|count
-//   - histogram -> quantile
-//   - summary -> quantile
-//
-// - If Query.kind=quantile, Query.quantile must be set.
-type StructuredQuery struct {
-	// Metric identifies the metric name and type.
-	// +kubebuilder:validation:Required
-	Metric MetricRef `json:"metric"`
-
-	// Query defines how to compute a value from the metric over a lookback window.
-	// +kubebuilder:validation:Required
-	Query MetricQuery `json:"query"`
-
-	// Match scopes the query to specific label sets and optional group-by dimensions.
-	// +kubebuilder:validation:Required
-	Match MetricMatch `json:"match"`
-}
-
-// MetricRef identifies a Prometheus metric and its type.
-//
-// Supported types:
-// - counter
-// - histogram
-// - summary
-//
-// Admission policy:
-//   - metric.type must be one of counter|histogram|summary (Enum).
-//   - metric.name must be non-empty (MinLength=1).
-//   - If metric.type=histogram, metric.name SHOULD reference the bucket series
-//     (typically *_bucket). If not, the controller/webhook should reject to prevent
-//     invalid histogram_quantile() queries.
-type MetricRef struct {
-	// Name is the Prometheus metric name to query.
-	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
-
-	// Type declares how the metric should be interpreted.
-	// +kubebuilder:validation:Enum=counter;histogram;summary
-	Type string `json:"type"`
-}
-
-// MetricQuery defines how to compute an observed value.
-//
-// Supported kinds:
-// - rate:     per-second rate over window (for counters)
-// - count:    total events in window via increase() (for counters)
-// - quantile: latency quantile (for histogram or summary)
-//
-// Admission policy (cross-field invariants):
-// - counter -> rate|count
-// - histogram -> quantile
-// - summary -> quantile
-// - If kind=quantile, quantile must be set (0..1).
-type MetricQuery struct {
-	// Kind selects the computation method.
-	// +kubebuilder:validation:Enum=rate;count;quantile
-	Kind string `json:"kind"`
-
-	// Aggregation determines how to aggregate series before comparison.
-	// If groupBy is set, aggregation is applied "by (groupBy...)".
-	// Defaults to "sum" for counters and "sum" for histogram buckets.
-	// +kubebuilder:validation:Enum=sum;avg;max;min
-	// +optional
-	Aggregation string `json:"aggregation,omitempty"`
-
-	// Quantile is required when kind=quantile.
-	// For histograms, this maps to histogram_quantile(q, ...).
-	// For summaries, this maps to selecting quantile-labeled series.
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1
-	// +optional
-	Quantile *float64 `json:"quantile,omitempty"`
-}
-
-// MetricMatch scopes a structured query.
-//
-// Labels are dynamic and organization-specific. Each entry is a Prometheus label matcher:
-// - If value starts with "~", it is treated as a regex matcher (k=~"re").
-// - Otherwise, it is treated as an exact matcher (k="v").
-//
-// GroupBy is optional. If set, the query returns a vector with one series per group,
-// and ANY-breach semantics apply.
-type MetricMatch struct {
-	// Labels is a set of dynamic label matchers (exact or regex).
-	// At least one label SHOULD be provided to avoid cluster-wide queries.
-	// +optional
-	Labels map[string]string `json:"labels,omitempty"`
-
-	// GroupBy lists label keys to group results by (e.g., ["pod"]).
-	// +optional
-	GroupBy []string `json:"groupBy,omitempty"`
-}
-
-// MetricCompare defines a threshold comparator for a rule.
-//
-// Ops:
-// - GT, GTE, LT, LTE, EQ, NEQ
-//
-// Note: EQ/NEQ should be implemented with a small tolerance in the controller
-// due to floating point representation.
-//
-// Admission policy:
-// - op must be one of GT|GTE|LT|LTE|EQ|NEQ (Enum).
-// - threshold must be a valid number (finite).
-type MetricCompare struct {
-	// Op defines the comparison operator.
-	// +kubebuilder:validation:Enum=GT;GTE;LT;LTE;EQ;NEQ
-	Op string `json:"op"`
-
-	// Threshold is the numeric threshold to compare against.
-	Threshold float64 `json:"threshold"`
-}
-
-// MeshFaultAction defines a single HTTP fault injection action applied
-// either to inbound or outbound traffic.
-//
-// Each MeshFaultAction:
-// - targets exactly one traffic direction (INBOUND or OUTBOUND)
-// - affects a bounded percentage of traffic
-// - is independently cleaned up by name
-// - may define multiple HTTP route matches
-//
-// Note: when defining multiple MeshFaultActions within the same FaultInjection,
-// ensure that their route matches do not overlap to avoid conflicting VirtualService rules.
-// This is the operator's responsibility when defining faults.
-// The controller MAY validate for overlapping matches and reject conflicting configurations.
-//
-// Note: when applying outbound faults with sourceSelector,
-// the controller MUST ensure that the affected pods do not exceed blastRadius.maxPodsAffected.
-// If the controller cannot safely estimate the number of affected pods,
-// it MUST abort the experiment to avoid wide-impact chaos.
-//
-// Note: the controller MUST clean up any created or patched VirtualServices
-// when the FaultInjection completes or is cancelled.
-type MeshFaultAction struct {
-	// Name uniquely identifies this fault within the FaultInjection.
-	//
-	// It is used to generate deterministic VirtualService rule names,
-	// enabling safe updates and cleanup.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=63
-	Name string `json:"name"`
-
-	// Direction specifies whether the fault applies to inbound
-	// traffic (requests entering the service) or outbound traffic
-	// (requests leaving the service to a dependency).
-	//
-	// INBOUND  → patch an existing VirtualService for the service
-	// OUTBOUND → patch or create a VirtualService targeting the destination host
-	// +kubebuilder:validation:Enum=INBOUND;OUTBOUND
-	Direction string `json:"direction"`
-
-	// Type defines the kind of HTTP fault to inject.
-	//
-	// HTTP_LATENCY → fixed delay injection
-	// HTTP_ABORT   → HTTP error response injection
-	// +kubebuilder:validation:Enum=HTTP_LATENCY;HTTP_ABORT
-	Type string `json:"type"`
-
-	// Percent defines the percentage of matching traffic affected by this fault.
-	//
-	// Admission policy:
-	// - Must be 0..100 (Maximum/Minimum).
-	// - Must be <= blastRadius.maxTrafficPercent (cross-field invariant; admission webhook/controller validation).
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=100
-	Percent int32 `json:"percent"`
-
-	// HTTP defines how the fault is applied at the HTTP routing layer.
-	// +kubebuilder:validation:Required
-	HTTP HTTPFaultSpec `json:"http"`
-}
-
-// HTTPFaultSpec defines how a mesh fault is applied to HTTP traffic.
-// The meaning of fields depends on the fault Direction:
-//
-// INBOUND:
-//   - virtualServiceRef MUST be set
-//   - destinationHosts MUST NOT be set
-//
-// OUTBOUND:
-//   - destinationHosts MUST be set
-//   - virtualServiceRef MAY be omitted (operator may create a managed VS)
-//
-// Admission policy (cross-field invariants; enforced by controller or admission webhook):
-// - When direction=INBOUND:
-//   - virtualServiceRef is required
-//   - destinationHosts must be omitted
-//
-// - When direction=OUTBOUND:
-//   - destinationHosts is required
-//   - virtualServiceRef is optional
-//
-// - For type=HTTP_LATENCY:
-//   - delay is required
-//   - abort must be omitted
-//
-// - For type=HTTP_ABORT:
-//
-//   - abort is required
-//
-//   - delay must be omitted
-//
-//   - timeout is optional for both types
-//
-//   - At least one route MUST be specified
-//
-//   - Each route MUST have at least one match condition
-//
-//   - Each match MUST specify at least one of uriPrefix or uriExact
-//     (if both are specified, uriExact takes precedence)
-//
-//   - If timeout is set, delay.fixedDelaySeconds MUST be greater than timeout.timeoutSeconds
-//     to simulate percentage-based timeouts.
-type HTTPFaultSpec struct {
-	// VirtualServiceRef references an existing VirtualService to patch.
-	//
-	// Admission policy:
-	// - Required when direction=INBOUND (cross-field invariant).
-	// - Optional when direction=OUTBOUND.
-	// +optional
-	VirtualServiceRef *VirtualServiceRef `json:"virtualServiceRef,omitempty"`
-
-	// DestinationHosts defines the destination hostnames for outbound faults.
-	//
-	// Admission policy:
-	// - Required when direction=OUTBOUND (cross-field invariant).
-	// - Must be omitted when direction=INBOUND (cross-field invariant).
-	// +kubebuilder:validation:MaxItems=32
-	// +optional
-	DestinationHosts []string `json:"destinationHosts,omitempty"`
-
-	// SourceSelector restricts OUTBOUND faults to traffic originating
-	// from workloads matching these labels.
-	//
-	// Admission policy:
-	// - Strongly recommended for safety; required if blastRadius.maxPodsAffected is set
-	//   (cross-field invariant enforced by controller/webhook).
-	// +optional
-	SourceSelector *LabelSelector `json:"sourceSelector,omitempty"`
-
-	// Routes define HTTP match conditions under which the fault applies.
-	// These routes are prepended before existing VirtualService rules.
-	//
-	// Admission policy:
-	// - Must have at least one entry (MinItems=1).
-	// - Each match must set at least one of uriPrefix or uriExact (cross-field invariant).
-	// +kubebuilder:validation:MinItems=1
-	Routes []HTTPRouteTarget `json:"routes"`
-
-	// Delay defines fixed latency injection.
-	//
-	// Admission policy:
-	// - Required for HTTP_LATENCY (cross-field invariant).
-	// - Must be omitted for HTTP_ABORT (cross-field invariant).
-	// +optional
-	Delay *DelayConfig `json:"delay,omitempty"`
-
-	// Abort defines HTTP abort (error) injection.
-	//
-	// Admission policy:
-	// - Required for HTTP_ABORT (cross-field invariant).
-	// - Must be omitted for HTTP_LATENCY (cross-field invariant).
-	// +optional
-	Abort *AbortConfig `json:"abort,omitempty"`
-
-	// Timeout defines an HTTP route timeout.
-	//
-	// Admission policy:
-	// - Optional for both types.
-	// - If set, delay.fixedDelaySeconds MUST be greater than timeout.timeoutSeconds
-	//   to simulate percentage-based timeouts (cross-field invariant).
-	// +optional
-	Timeout *TimeoutConfig `json:"timeout,omitempty"`
-}
-
-// VirtualServiceRef identifies an existing Istio VirtualService in the same namespace.
-// Used to scope inbound faults to a specific service.
-type VirtualServiceRef struct {
-	// Name of the VirtualService.
-	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
-}
-
 // LabelSelector defines a simple label-based workload selector.
 // Used to scope outbound faults to specific source workloads.
 type LabelSelector struct {
 	// MatchLabels restricts matching to workloads that have all of the specified labels.
 	// +kubebuilder:validation:MinProperties=1
 	MatchLabels map[string]string `json:"matchLabels"`
-}
-
-// HTTPRouteTarget defines a single HTTP routing match.
-// Multiple targets may be specified per fault action.
-type HTTPRouteTarget struct {
-	// Match defines how incoming requests are matched.
-	// +kubebuilder:validation:Required
-	Match HTTPMatch `json:"match"`
-}
-
-// HTTPMatch defines HTTP request matching criteria.
-//
-// Admission policy (cross-field invariants; enforced by controller or admission webhook):
-// - At least ONE of uriPrefix or uriExact MUST be specified.
-// - If both are specified, uriExact takes precedence.
-type HTTPMatch struct {
-	// URIPrefix matches requests whose URI starts with this prefix.
-	// Example: /VendorAPI
-	// +kubebuilder:validation:MinLength=1
-	// +optional
-	URIPrefix string `json:"uriPrefix,omitempty"`
-
-	// URIExact matches requests whose URI exactly equals this value.
-	// Example: /VendorAPI/v1/orders
-	// +kubebuilder:validation:MinLength=1
-	// +optional
-	URIExact string `json:"uriExact,omitempty"`
-
-	// Headers defines optional exact-match HTTP headers.
-	// +optional
-	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // DelayConfig defines fixed latency injection parameters.
@@ -690,6 +363,10 @@ type FaultInjectionStatus struct {
 	// Rules captures per-rule evaluation state (interval scheduling + debouncing).
 	// +optional
 	Rules []StopRuleStatus `json:"rules,omitempty"`
+
+	// PodFaults records per-action pod fault execution state.
+	// +optional
+	PodFaults []PodFaultTickStatus `json:"podFaults,omitempty"`
 }
 
 // StopRuleStatus stores per-rule evaluation state.

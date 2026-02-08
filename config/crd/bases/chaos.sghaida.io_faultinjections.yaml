@@ -42,7 +42,7 @@ spec:
               actions:
                 description: |-
                   Actions defines the concrete chaos actions to execute.
-                  At least one mesh fault must be specified.
+                  At least one of meshFaults or podFaults must be specified.
                 properties:
                   meshFaults:
                     description: |-
@@ -270,11 +270,230 @@ spec:
                       - percent
                       - type
                       type: object
-                    minItems: 1
                     type: array
-                required:
-                - meshFaults
+                  podFaults:
+                    description: |-
+                      PodFaults defines pod-level faults (bounded and time-boxed).
+                      Each entry is executed independently.
+                    items:
+                      description: |-
+                        PodFaultAction defines a single pod-level chaos action.
+                        Audit is mandatory: the controller MUST emit events, log, and record the affected pod names in status.
+                        Cross-field validation:
+                        - FORCEFUL requires gracePeriodSeconds == 0
+                        - GRACEFUL requires gracePeriodSeconds > 0
+                        PodFaultAction defines how a pod-level fault is applied to Kubernetes workloads.
+
+                        Semantics:
+
+                        - type=POD_DELETE:
+                          - Deletes selected pods in the target (graceful or forceful).
+                          - The controller MUST record the impacted pod names in status and emit events for auditability.
+
+                        Defaulting:
+
+                        - policy.executionMode defaults to ONE_SHOT.
+                        - target.namespace defaults to the FaultInjection namespace (controller-enforced) when omitted.
+                        - guardrails.refuseIfPodsLessThan defaults to 1.
+                        - guardrails.respectPodDisruptionBudget defaults to true.
+
+                        Admission policy (cross-field invariants; enforced by CRD validation, admission webhook, or controller):
+
+                        - Termination mode and grace period:
+                          - When termination.mode=FORCEFUL:
+                          - termination.gracePeriodSeconds MUST be 0
+                          - When termination.mode=GRACEFUL:
+                          - termination.gracePeriodSeconds MUST be > 0
+
+                        - Execution mode and window:
+                          - When policy.executionMode=WINDOWED:
+                          - window is required
+                          - When policy.executionMode=ONE_SHOT (or policy omitted):
+                          - window MUST be omitted
+
+                        - Pod selection mode:
+                          - When selection.mode=COUNT:
+                          - selection.count is required
+                          - selection.percent MUST be omitted
+                          - When selection.mode=PERCENT:
+                          - selection.percent is required (1..100)
+                          - selection.count MUST be omitted
+
+                        Safety expectations:
+
+                          - guardrails are mandatory.
+                          - selection.maxPodsAffected (if set) acts as an additional per-action cap and is still bounded by
+                            spec.blastRadius.maxPodsAffected (if the parent FaultInjection defines it).
+
+                        - WINDOWED requires window to be set; ONE_SHOT forbids window
+                      properties:
+                        guardrails:
+                          description: Guardrails are mandatory safety constraints
+                            for pod faults.
+                          properties:
+                            refuseIfPodsLessThan:
+                              default: 1
+                              description: |-
+                                RefuseIfPodsLessThan prevents taking down tiny fleets accidentally.
+                                Default: 1.
+                              format: int32
+                              minimum: 1
+                              type: integer
+                            respectPodDisruptionBudget:
+                              default: true
+                              description: |-
+                                RespectPodDisruptionBudget controls whether the controller must respect PDB constraints.
+                                Default: true.
+                              type: boolean
+                          type: object
+                        name:
+                          description: Name is a stable identifier for this action
+                            within the experiment.
+                          minLength: 1
+                          type: string
+                        policy:
+                          description: Policy controls how this action is applied.
+                          properties:
+                            executionMode:
+                              default: ONE_SHOT
+                              description: ExecutionMode defaults to ONE_SHOT.
+                              enum:
+                              - ONE_SHOT
+                              - WINDOWED
+                              type: string
+                          type: object
+                        selection:
+                          description: Selection controls how many pods are affected.
+                          properties:
+                            count:
+                              description: Count is used when mode=COUNT.
+                              format: int32
+                              minimum: 1
+                              type: integer
+                            maxPodsAffected:
+                              description: MaxPodsAffected is an optional per-action
+                                cap (also bounded by spec.blastRadius.maxPodsAffected).
+                              format: int32
+                              minimum: 1
+                              type: integer
+                            mode:
+                              description: Mode selects count-based or percent-based
+                                selection.
+                              enum:
+                              - COUNT
+                              - PERCENT
+                              type: string
+                            percent:
+                              description: Percent is used when mode=PERCENT.
+                              format: int32
+                              maximum: 100
+                              minimum: 1
+                              type: integer
+                          required:
+                          - mode
+                          type: object
+                          x-kubernetes-validations:
+                          - message: set exactly one of selection.count or selection.percent
+                              based on selection.mode
+                            rule: (self.mode == 'COUNT' && has(self.count) && !has(self.percent))
+                              || (self.mode == 'PERCENT' && has(self.percent) && !has(self.count))
+                        target:
+                          description: Target selects pods to affect.
+                          properties:
+                            namespace:
+                              description: |-
+                                Namespace is the namespace to select pods from.
+                                If omitted, defaults to the FaultInjection namespace (controller-enforced).
+                              type: string
+                            selector:
+                              description: Selector matches pods by labels.
+                              properties:
+                                matchLabels:
+                                  additionalProperties:
+                                    type: string
+                                  description: MatchLabels restricts matching to workloads
+                                    that have all of the specified labels.
+                                  minProperties: 1
+                                  type: object
+                              required:
+                              - matchLabels
+                              type: object
+                          required:
+                          - selector
+                          type: object
+                        termination:
+                          description: Termination controls graceful vs forceful termination
+                            semantics.
+                          properties:
+                            gracePeriodSeconds:
+                              description: |-
+                                GracePeriodSeconds controls deletion grace period.
+                                Cross-field validation is enforced on PodFaultAction.
+                              format: int64
+                              minimum: 0
+                              type: integer
+                            mode:
+                              description: Mode selects graceful vs forceful termination.
+                              enum:
+                              - GRACEFUL
+                              - FORCEFUL
+                              type: string
+                          required:
+                          - gracePeriodSeconds
+                          - mode
+                          type: object
+                        type:
+                          description: Type selects the action behavior.
+                          enum:
+                          - POD_DELETE
+                          type: string
+                        window:
+                          description: |-
+                            Window controls windowed execution parameters.
+                            Required when policy.executionMode=WINDOWED and forbidden otherwise.
+                          properties:
+                            intervalSeconds:
+                              description: IntervalSeconds is the cadence for re-applying
+                                the action during WINDOWED execution.
+                              format: int32
+                              minimum: 1
+                              type: integer
+                            maxTotalPodsAffected:
+                              description: MaxTotalPodsAffected is a hard cap across
+                                the entire experiment window for this action.
+                              format: int32
+                              minimum: 1
+                              type: integer
+                          required:
+                          - intervalSeconds
+                          - maxTotalPodsAffected
+                          type: object
+                      required:
+                      - guardrails
+                      - name
+                      - selection
+                      - target
+                      - termination
+                      - type
+                      type: object
+                      x-kubernetes-validations:
+                      - message: termination.gracePeriodSeconds must be 0 for FORCEFUL
+                          and >0 for GRACEFUL
+                        rule: (self.termination.mode == 'FORCEFUL' && self.termination.gracePeriodSeconds
+                          == 0) || (self.termination.mode == 'GRACEFUL' && self.termination.gracePeriodSeconds
+                          > 0)
+                      - message: window must be set when executionMode=WINDOWED and
+                          must be omitted when executionMode=ONE_SHOT
+                        rule: ((has(self.policy) && self.policy.executionMode == 'WINDOWED')
+                          && has(self.window)) || ((!has(self.policy) || self.policy.executionMode
+                          == 'ONE_SHOT') && !has(self.window))
+                    type: array
                 type: object
+                x-kubernetes-validations:
+                - message: at least one of actions.meshFaults or actions.podFaults
+                    must be specified
+                  rule: (has(self.meshFaults) && size(self.meshFaults) > 0) || (has(self.podFaults)
+                    && size(self.podFaults) > 0)
               blastRadius:
                 description: |-
                   BlastRadius defines temporal and safety constraints for the experiment.
@@ -613,6 +832,53 @@ spec:
                 - Error
                 - Cancelled
                 type: string
+              podFaults:
+                description: PodFaults records per-action pod fault execution state.
+                items:
+                  description: |-
+                    PodFaultTickStatus records per-action, per-tick execution state for pod faults.
+                    controller will use it to record affected pod names in status (planned/executed)
+                  properties:
+                    actionName:
+                      description: ActionName is the pod fault action name from spec.actions.podFaults[].name.
+                      type: string
+                    executedAt:
+                      description: ExecutedAt is when the controller observed completion/failure
+                        of the executor job.
+                      format: date-time
+                      type: string
+                    jobName:
+                      description: JobName is the executor Job name created for this
+                        tick.
+                      type: string
+                    message:
+                      description: Message provides additional context (error, completion
+                        note).
+                      type: string
+                    plannedAt:
+                      description: PlannedAt is when the controller selected target
+                        pods for this tick.
+                      format: date-time
+                      type: string
+                    plannedPods:
+                      description: PlannedPods are the exact pod names selected by
+                        the controller for this tick.
+                      items:
+                        type: string
+                      type: array
+                    state:
+                      description: 'State is one of: Planned, Running, Succeeded,
+                        Failed.'
+                      type: string
+                    tickId:
+                      description: TickID is "oneshot" or a window tick number string
+                        ("0","1",...).
+                      type: string
+                  required:
+                  - actionName
+                  - tickId
+                  type: object
+                type: array
               rules:
                 description: Rules captures per-rule evaluation state (interval scheduling
                   + debouncing).
