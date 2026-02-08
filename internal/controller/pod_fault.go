@@ -763,6 +763,27 @@ func (r *FaultInjectionReconciler) createPodFaultJobIfNotExists(
 	ad := defaultPodFaultJobActiveDeadlineSeconds
 	bo := defaultPodFaultJobBackoffLimit
 
+	// Build: kubectl delete pod <pods...> -n <ns> --wait=false [--grace-period=0 --force] / [--grace-period=N]
+	args := []string{"delete", "pod"}
+	args = append(args, p.PodNames...)
+	args = append(args,
+		"-n", p.Namespace,
+		"--wait=false",
+		"--ignore-not-found=true",
+	)
+
+	if p.TerminationMode == chaosv1alpha1.PodTerminationModeForceful || string(p.TerminationMode) == "FORCEFUL" {
+		args = append(args,
+			"--grace-period=0",
+			"--force",
+		)
+	} else {
+		// Graceful: let kube respect grace period.
+		args = append(args,
+			"--grace-period="+fmt.Sprintf("%d", p.GracePeriodSecs),
+		)
+	}
+
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: p.Namespace,
@@ -803,43 +824,14 @@ func (r *FaultInjectionReconciler) createPodFaultJobIfNotExists(
 					ServiceAccountName: "fi-podfault-executor",
 					Containers: []corev1.Container{
 						{
-							Name: "executor",
-							// TODO: think later which image to use for the job
-							// this is added for the test script to run
-							// alpine:3.20 might be better option
-							// this should be passed using env to make it more flexable
+							Name:            "executor",
 							Image:           "registry.k8s.io/kubectl:v1.29.0",
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Command:         []string{"/bin/sh", "-lc"},
-							// TODO: the script should be passed from script and use embed
-							// for the time being keep it there for the sake of POC
 
-							Args: []string{
-								`
-								set -euo pipefail
+							// IMPORTANT: this image doesn't have /bin/sh. Run kubectl directly.
+							Command: []string{"kubectl"},
+							Args:    args,
 
-								echo "FI=$FI_NAME action=$ACTION_NAME tick=$TICK_ID ns=$TARGET_NAMESPACE pods=$POD_NAMES_CSV mode=$TERMINATION_MODE grace=$GRACE_PERIOD_SECONDS"
-
-								IFS=',' read -r -a PODS <<< "$POD_NAMES_CSV"
-
-								if [ "${#PODS[@]}" -eq 0 ]; then
-								echo "no pods to delete"
-								exit 0
-								fi
-
-								for p in "${PODS[@]}"; do
-								echo "deleting pod $TARGET_NAMESPACE/$p"
-
-								if [ "$TERMINATION_MODE" = "FORCEFUL" ]; then
-									kubectl -n "$TARGET_NAMESPACE" delete pod "$p" --grace-period=0 --force --wait=false
-								else
-									kubectl -n "$TARGET_NAMESPACE" delete pod "$p" --grace-period="$GRACE_PERIOD_SECONDS" --wait=false
-								fi
-								done
-
-								echo "done"
-								`,
-							},
 							Env: []corev1.EnvVar{
 								{Name: "FI_NAME", Value: fi.Name},
 								{Name: "ACTION_NAME", Value: p.ActionName},
