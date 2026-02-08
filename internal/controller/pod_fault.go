@@ -248,10 +248,12 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 		return false, earliestDue, perr
 	}
 
+	pending := false
+
 	for _, p := range plans {
 		// 1) If Job exists => observe its state.
 		job := &batchv1.Job{}
-		jobKey := types.NamespacedName{Namespace: fi.Namespace, Name: p.JobName}
+		jobKey := types.NamespacedName{Namespace: p.Namespace, Name: p.JobName}
 		jobExists := false
 
 		if err := r.Get(ctx, jobKey, job); err == nil {
@@ -265,7 +267,19 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 		if jobExists {
 			if isJobComplete(job) {
 				// Record executed result in FI status.
-				_ = r.recordPodFaultExecuted(ctx, fi, p, now, true, "completed")
+				if uerr := r.recordPodFaultExecuted(ctx, fi, p, now, true, "completed"); uerr != nil {
+					r.eventf(fi, "Warning", "PodFaultStatusUpdateFailed", "podfault-status",
+						"Failed updating podfault status to Succeeded for action %q tick %q: %v",
+						p.ActionName, p.TickID, uerr)
+					return false, earliestDue, uerr
+				}
+
+				// delete job right after we recorded outcome (keeps namespace clean).
+				if derr := r.Delete(ctx, job); derr != nil && !apierrors.IsNotFound(derr) {
+					r.eventf(fi, "Warning", "PodFaultJobDeleteFailed", "podfault-cleanup",
+						"Failed deleting completed podfault Job %s/%s: %v", job.Namespace, job.Name, derr)
+					// don’t fail the whole reconcile; status already recorded
+				}
 
 				r.eventf(fi, "Normal", "PodFaultCompleted", "podfault-complete",
 					"Pod fault action %q tick %q completed (job=%s/%s)",
@@ -275,7 +289,18 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 
 			if isJobFailed(job) {
 				// Record executed failure in FI status and fail-closed.
-				_ = r.recordPodFaultExecuted(ctx, fi, p, now, false, "failed")
+				if uerr := r.recordPodFaultExecuted(ctx, fi, p, now, false, "failed"); uerr != nil {
+					r.eventf(fi, "Warning", "PodFaultStatusUpdateFailed", "podfault-status",
+						"Failed updating podfault status to Failed for action %q tick %q: %v",
+						p.ActionName, p.TickID, uerr)
+					return false, earliestDue, uerr
+				}
+
+				// delete job right after we recorded outcome.
+				if derr := r.Delete(ctx, job); derr != nil && !apierrors.IsNotFound(derr) {
+					r.eventf(fi, "Warning", "PodFaultJobDeleteFailed", "podfault-cleanup",
+						"Failed deleting failed podfault Job %s/%s: %v", job.Namespace, job.Name, derr)
+				}
 
 				msg := fmt.Sprintf(
 					"pod fault action %q tick %q failed (job=%s/%s)",
@@ -290,7 +315,7 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 					p.ActionName, p.TickID, job.Namespace, job.Name)
 				return true, earliestDue, nil
 			}
-
+			pending = true
 			log.Info("podfault job running",
 				"fi", fi.Name, "action", p.ActionName, "tick", p.TickID, "job", job.Name)
 			continue
@@ -378,12 +403,19 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 				"Failed creating podfault Job for action %q tick %q: %v", p.ActionName, p.TickID, err)
 			return false, earliestDue, err
 		}
+		pending = true
 
 		r.eventf(fi, "Normal", "PodFaultJobCreated", "podfault-job-create",
 			"Created podfault Job for action %q tick %q (job=%s/%s)",
 			p.ActionName, p.TickID, fi.Namespace, p.JobName)
 	}
 
+	if pending {
+		soon := now.Add(2 * time.Second)
+		if earliestDue == nil || soon.Before(*earliestDue) {
+			earliestDue = &soon
+		}
+	}
 	return false, earliestDue, nil
 }
 
@@ -1021,6 +1053,13 @@ func isJobComplete(j *batchv1.Job) bool {
 			return true
 		}
 	}
+	// Fallbacks
+	if j.Status.CompletionTime != nil {
+		return true
+	}
+	if j.Status.Succeeded > 0 {
+		return true
+	}
 	return false
 }
 
@@ -1030,6 +1069,10 @@ func isJobFailed(j *batchv1.Job) bool {
 		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
 			return true
 		}
+	}
+	// Fallback: BackoffLimit=0 => a single pod failure is terminal.
+	if j.Status.Failed > 0 {
+		return true
 	}
 	return false
 }

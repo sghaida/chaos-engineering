@@ -124,6 +124,8 @@ import (
 
 	"github.com/go-logr/logr"
 	chaosv1alpha1 "github.com/sghaida/fi-operator/api/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
+	coordv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -795,6 +797,8 @@ func (r *FaultInjectionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&chaosv1alpha1.FaultInjection{}).
+		Owns(&batchv1.Job{}).
+		Owns(&coordv1.Lease{}).
 		Named("faultinjection").
 		Complete(r)
 }
