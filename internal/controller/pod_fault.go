@@ -808,8 +808,9 @@ func (r *FaultInjectionReconciler) createPodFaultJobIfNotExists(
 							// this is added for the test script to run
 							// alpine:3.20 might be better option
 							// this should be passed using env to make it more flexable
-							Image:   "bitnami/kubectl:1.29",
-							Command: []string{"/bin/sh", "-lc"},
+							Image:           "registry.k8s.io/kubectl:v1.29.0",
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Command:         []string{"/bin/sh", "-lc"},
 							// TODO: the script should be passed from script and use embed
 							// for the time being keep it there for the sake of POC
 
@@ -817,29 +818,23 @@ func (r *FaultInjectionReconciler) createPodFaultJobIfNotExists(
 								`
 								set -euo pipefail
 
-								echo "FI_NAME=$FI_NAME ACTION_NAME=$ACTION_NAME TICK_ID=$TICK_ID"
-								echo "TARGET_NAMESPACE=$TARGET_NAMESPACE"
-								echo "POD_NAMES_CSV=$POD_NAMES_CSV"
-								echo "TERMINATION_MODE=$TERMINATION_MODE GRACE_PERIOD_SECONDS=$GRACE_PERIOD_SECONDS"
+								echo "FI=$FI_NAME action=$ACTION_NAME tick=$TICK_ID ns=$TARGET_NAMESPACE pods=$POD_NAMES_CSV mode=$TERMINATION_MODE grace=$GRACE_PERIOD_SECONDS"
 
-								IFS=',' read -r -a PODS <<< "${POD_NAMES_CSV:-}"
+								IFS=',' read -r -a PODS <<< "$POD_NAMES_CSV"
+
 								if [ "${#PODS[@]}" -eq 0 ]; then
-								echo "no pods to delete; exiting 0"
+								echo "no pods to delete"
 								exit 0
 								fi
 
-								# Decide grace period
-								GRACE="${GRACE_PERIOD_SECONDS:-0}"
-								if [ "${TERMINATION_MODE:-}" = "FORCEFUL" ]; then
-								GRACE="0"
-								fi
-
 								for p in "${PODS[@]}"; do
-								p="$(echo "$p" | xargs)" # trim
-								[ -z "$p" ] && continue
+								echo "deleting pod $TARGET_NAMESPACE/$p"
 
-								echo "deleting pod ${TARGET_NAMESPACE}/${p} (grace=${GRACE})"
-								kubectl -n "$TARGET_NAMESPACE" delete pod "$p" --ignore-not-found=true --grace-period="$GRACE"
+								if [ "$TERMINATION_MODE" = "FORCEFUL" ]; then
+									kubectl -n "$TARGET_NAMESPACE" delete pod "$p" --grace-period=0 --force --wait=false
+								else
+									kubectl -n "$TARGET_NAMESPACE" delete pod "$p" --grace-period="$GRACE_PERIOD_SECONDS" --wait=false
+								fi
 								done
 
 								echo "done"

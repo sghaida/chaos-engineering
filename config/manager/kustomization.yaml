@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: fi-operator
-  newTag: "0469279"
+  newTag: fabb108
