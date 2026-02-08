@@ -231,6 +231,8 @@ type podFaultPlan struct {
 // Return values:
 //   - stop: true if a job failed and the reconciler should stop the experiment.
 //   - nextDue: earliest upcoming tick boundary across all windowed actions (used for requeue).
+//
+//nolint:gocyclo,cyclop // reconciler complexity is intentional
 func (r *FaultInjectionReconciler) applyPodFaults(
 	ctx context.Context,
 	log logr.Logger,
