@@ -527,13 +527,25 @@ func (r *FaultInjectionReconciler) handleExpiry(ctx context.Context, log logr.Lo
 		return ctrl.Result{}, err
 	}
 
-	fi.Status.Phase = CompletedPhase
-	fi.Status.Message = "Expired: cleaned up injected rules"
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		key := client.ObjectKeyFromObject(fi)
 
-	if err := r.Status().Update(ctx, fi); err != nil {
+		var latest chaosv1alpha1.FaultInjection
+		if err := r.Get(ctx, key, &latest); err != nil {
+			return err
+		}
+
+		latest.Status.Phase = CompletedPhase
+		latest.Status.Message = "Expired: cleaned up injected rules"
+		if latest.Status.StopReason == "" {
+			latest.Status.StopReason = "expired: blastRadius duration reached"
+		}
+
+		return r.Status().Update(ctx, &latest)
+	}); err != nil {
 		log.Error(err, "failed to persist Completed status after expiry", "name", fi.Name, "ns", fi.Namespace)
-		r.eventf(fi, "Warning", "StatusUpdateFailed", "status-update", "Failed to persist Completed status after expiry: %v", err)
-
+		r.eventf(fi, "Warning", "StatusUpdateFailed", "status-update",
+			"Failed to persist Completed status after expiry: %v", err)
 		return ctrl.Result{}, err
 	}
 
