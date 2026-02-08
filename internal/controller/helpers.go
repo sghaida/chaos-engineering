@@ -1,11 +1,16 @@
 package controller
 
 import (
+	"context"
+	"hash/fnv"
 	"maps"
 	"sort"
 	"strings"
 
+	chaosv1alpha1 "github.com/sghaida/fi-operator/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // sanitizeName normalizes an arbitrary string into a DNS-like, lowercase, dash-separated name.
@@ -175,4 +180,85 @@ func (r *FaultInjectionReconciler) eventf(
 		return
 	}
 	r.Recorder.Eventf(regarding, nil, eventType, reason, action, noteFmt, args...)
+}
+
+// fiShortID returns a short, DNS-safe, deterministic identifier for a FaultInjection.
+// - Stable across reconciles for the same object (uses UID).
+// - Short enough to keep Job/Lease names < 63 chars.
+// - DNS_LABEL safe: lowercase [a-z0-9-] (we only emit [0-9a-z]).
+func fiShortID(fi *chaosv1alpha1.FaultInjection) string {
+	uid := strings.TrimSpace(string(fi.UID))
+	if uid == "" {
+		// Fallback: still deterministic-ish if UID not populated (rare).
+		uid = strings.TrimSpace(fi.Namespace + "/" + fi.Name)
+	}
+
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(uid))
+	sum := h.Sum64()
+
+	// base36 encode the hash to reduce length; 10 chars is plenty.
+	// We take the lower 64 bits (already) and encode.
+	return base36u64(sum)[:10]
+}
+
+func base36u64(v uint64) string {
+	// Convert uint64 to a base36 string without using big.Int.
+	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+	if v == 0 {
+		return "0"
+	}
+	var b [13]byte // max length for base36 of uint64 is 13
+	i := len(b)
+	for v > 0 {
+		i--
+		b[i] = alphabet[v%36]
+		v /= 36
+	}
+	return string(b[i:])
+}
+
+// optional: sometimes you want a short id for non-FI strings too
+func shortHash10(s string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	sum := h.Sum64()
+
+	// same style
+	return base36u64(sum)[:10]
+}
+
+func (r *FaultInjectionReconciler) setFIStatusPhaseMessage(
+	ctx context.Context,
+	fi *chaosv1alpha1.FaultInjection,
+	phase string,
+	msg string,
+) error {
+	key := client.ObjectKeyFromObject(fi)
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var latest chaosv1alpha1.FaultInjection
+		if err := r.Get(ctx, key, &latest); err != nil {
+			return err
+		}
+
+		latest.Status.Phase = phase
+		latest.Status.Message = msg
+
+		return r.Status().Update(ctx, &latest)
+	})
+}
+
+func safeLabelValue(s string) string {
+	slug := sanitizeName(s)
+	if len(slug) <= 63 {
+		return slug
+	}
+	// keep deterministic uniqueness
+	// reserve 1 for '-' + 10 for hash
+	cut := 63 - 11
+	if cut < 1 {
+		return shortHash10(slug)[:min(10, 63)]
+	}
+	return slug[:cut] + "-" + shortHash10(slug)[:10]
 }

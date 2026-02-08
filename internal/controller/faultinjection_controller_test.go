@@ -1181,6 +1181,7 @@ var _ = Describe("FaultInjection Controller - Pod faults", func() {
 		sch := runtime.NewScheme()
 		Expect(clientgoscheme.AddToScheme(sch)).To(Succeed())
 		Expect(chaosv1alpha1.AddToScheme(sch)).To(Succeed())
+		Expect(coordv1.AddToScheme(sch)).To(Succeed())
 
 		fi := &chaosv1alpha1.FaultInjection{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1205,7 +1206,14 @@ var _ = Describe("FaultInjection Controller - Pod faults", func() {
 			HolderIdentity: "", // expect default "fi-operator"
 		}
 
-		ok, reason, err := rec.tryAcquireOrTakeoverLease(ctx, fi, "lease-a", time.Now().UTC())
+		p := podFaultPlan{
+			ActionName: "a",
+			TickID:     "oneshot",
+			Namespace:  ns,
+			LeaseName:  "lease-a",
+		}
+
+		ok, reason, err := rec.tryAcquireOrTakeoverLease(ctx, fi, p, time.Now().UTC())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(ok).To(BeTrue())
 		Expect(reason).To(Equal("created"))
@@ -1234,8 +1242,16 @@ var _ = Describe("FaultInjection Controller - Pod faults", func() {
 		Expect(k8sClient.Create(ctx, l)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, l) }()
 
-		rec := &FaultInjectionReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: testRecorder(), HolderIdentity: "me"}
-		ok, reason, err := rec.tryAcquireOrTakeoverLease(ctx, fi, "lease-b", now.Add(5*time.Second))
+		rec := &FaultInjectionReconciler{
+			Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: testRecorder(), HolderIdentity: "me",
+		}
+		p := podFaultPlan{
+			ActionName: "a",
+			TickID:     "oneshot",
+			Namespace:  ns,
+			LeaseName:  "lease-b",
+		}
+		ok, reason, err := rec.tryAcquireOrTakeoverLease(ctx, fi, p, now.Add(5*time.Second))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(ok).To(BeFalse())
 		Expect(reason).To(ContainSubstring(`held by "someone"`))
@@ -1245,6 +1261,7 @@ var _ = Describe("FaultInjection Controller - Pod faults", func() {
 		sch := runtime.NewScheme()
 		Expect(clientgoscheme.AddToScheme(sch)).To(Succeed())
 		Expect(chaosv1alpha1.AddToScheme(sch)).To(Succeed())
+		Expect(coordv1.AddToScheme(sch)).To(Succeed())
 
 		fi := &chaosv1alpha1.FaultInjection{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1296,13 +1313,21 @@ var _ = Describe("FaultInjection Controller - Pod faults", func() {
 			HolderIdentity: "new",
 		}
 
-		ok, reason, err := rec.tryAcquireOrTakeoverLease(ctx, fi, "lease-c", time.Now().UTC())
+		p := podFaultPlan{
+			ActionName: "a",
+			TickID:     "0",
+			Namespace:  ns,
+			LeaseName:  "lease-c",
+		}
+
+		ok, reason, err := rec.tryAcquireOrTakeoverLease(ctx, fi, p, time.Now().UTC())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(ok).To(BeTrue())
 		Expect(reason).To(ContainSubstring("taken over"))
 
 		l2 := &coordv1.Lease{}
 		Expect(cl.Get(ctx, types.NamespacedName{Namespace: ns, Name: "lease-c"}, l2)).To(Succeed())
+		Expect(l2.Spec.HolderIdentity).NotTo(BeNil())
 		Expect(*l2.Spec.HolderIdentity).To(Equal("new"))
 	})
 

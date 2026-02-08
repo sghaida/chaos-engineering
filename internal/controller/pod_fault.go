@@ -277,12 +277,13 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 				// Record executed failure in FI status and fail-closed.
 				_ = r.recordPodFaultExecuted(ctx, fi, p, now, false, "failed")
 
-				fi.Status.Phase = ErrorPhase
-				fi.Status.Message = fmt.Sprintf(
+				msg := fmt.Sprintf(
 					"pod fault action %q tick %q failed (job=%s/%s)",
 					p.ActionName, p.TickID, job.Namespace, job.Name,
 				)
-				_ = r.Status().Update(ctx, fi)
+				if uerr := r.setFIStatusPhaseMessage(ctx, fi, ErrorPhase, msg); uerr != nil {
+					return true, earliestDue, uerr
+				}
 
 				r.eventf(fi, "Warning", "PodFaultFailed", "podfault-failed",
 					"Pod fault action %q tick %q failed (job=%s/%s)",
@@ -312,9 +313,9 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 
 			r.eventf(fi, "Warning", "PodFaultRefused", "podfault-select", msg)
 
-			fi.Status.Phase = ErrorPhase
-			fi.Status.Message = msg
-			_ = r.Status().Update(ctx, fi)
+			if uerr := r.setFIStatusPhaseMessage(ctx, fi, ErrorPhase, msg); uerr != nil {
+				return true, earliestDue, uerr
+			}
 
 			return true, earliestDue, nil // stop reconcile; no job creation
 		}
@@ -354,7 +355,7 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 		_ = r.recordPodFaultPlanned(ctx, fi, p, now)
 
 		// 3) Acquire/takeover per-tick lease.
-		acquired, reason, lerr := r.tryAcquireOrTakeoverLease(ctx, fi, p.LeaseName, now)
+		acquired, reason, lerr := r.tryAcquireOrTakeoverLease(ctx, fi, p, now)
 		if lerr != nil {
 			r.eventf(fi, "Warning", "PodFaultLeaseError", "podfault-lease",
 				"Lease error for action %q tick %q: %v", p.ActionName, p.TickID, lerr)
@@ -432,7 +433,7 @@ func (r *FaultInjectionReconciler) buildPodFaultPlans(
 			tickID, dueAt = wTickID, wDueAt
 		}
 
-		jobName, leaseName := podFaultNames(fi.Name, a.Name, tickID)
+		jobName, leaseName := podFaultNames(fi, a.Name, tickID)
 
 		plans = append(plans, podFaultPlan{
 			ActionName: a.Name,
@@ -571,7 +572,7 @@ func selectPodNamesDeterministically(
 func (r *FaultInjectionReconciler) tryAcquireOrTakeoverLease(
 	ctx context.Context,
 	fi *chaosv1alpha1.FaultInjection,
-	leaseName string,
+	p podFaultPlan,
 	now time.Time,
 ) (bool, string, error) {
 
@@ -580,7 +581,13 @@ func (r *FaultInjectionReconciler) tryAcquireOrTakeoverLease(
 		holder = "fi-operator"
 	}
 
-	key := types.NamespacedName{Namespace: fi.Namespace, Name: leaseName}
+	// Use the plan namespace (not fi.Namespace) so artifacts live with the target.
+	leaseNS := p.Namespace
+	if strings.TrimSpace(leaseNS) == "" {
+		leaseNS = fi.Namespace
+	}
+
+	key := types.NamespacedName{Namespace: leaseNS, Name: p.LeaseName}
 	lease := &coordv1.Lease{}
 
 	// Fast-path: create if missing.
@@ -592,11 +599,19 @@ func (r *FaultInjectionReconciler) tryAcquireOrTakeoverLease(
 		d := defaultPodFaultLeaseDurationSeconds
 		lease = &coordv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: fi.Namespace,
-				Name:      leaseName,
+				Namespace: leaseNS,
+				Name:      p.LeaseName,
 				Labels: map[string]string{
-					"chaos.sghaida.io/fi":   fi.Name,
-					"chaos.sghaida.io/kind": "podfault",
+					"chaos.sghaida.io/fi":     fi.Name,
+					"chaos.sghaida.io/fi-uid": string(fi.UID),
+					"chaos.sghaida.io/kind":   "podfault",
+					"chaos.sghaida.io/action": safeLabelValue(p.ActionName), // IMPORTANT: add on create
+					"chaos.sghaida.io/tick":   safeLabelValue(p.TickID),     // IMPORTANT: add on create
+					"chaos.sghaida.io/holder": safeLabelValue(holder),       // debug who owns it
+				},
+				Annotations: map[string]string{
+					"chaos.sghaida.io/fi-name":   fi.Name,
+					"chaos.sghaida.io/fi-action": p.ActionName,
 				},
 			},
 			Spec: coordv1.LeaseSpec{
@@ -690,6 +705,17 @@ func (r *FaultInjectionReconciler) tryAcquireOrTakeoverLease(
 			latest.Spec.LeaseDurationSeconds = &dd
 		}
 
+		if latest.Labels == nil {
+			latest.Labels = map[string]string{}
+		}
+		latest.Labels["chaos.sghaida.io/fi"] = fi.Name
+		latest.Labels["chaos.sghaida.io/fi-uid"] = string(fi.UID)
+		latest.Labels["chaos.sghaida.io/fi-short"] = fiShortID(fi)
+		latest.Labels["chaos.sghaida.io/kind"] = "podfault"
+		latest.Labels["chaos.sghaida.io/action"] = safeLabelValue(p.ActionName)
+		latest.Labels["chaos.sghaida.io/tick"] = safeLabelValue(p.TickID)
+		latest.Labels["chaos.sghaida.io/holder"] = safeLabelValue(holder)
+
 		return r.Update(ctx, latest)
 	})
 	if err != nil {
@@ -725,7 +751,7 @@ func (r *FaultInjectionReconciler) createPodFaultJobIfNotExists(
 	p podFaultPlan,
 ) error {
 
-	key := types.NamespacedName{Namespace: fi.Namespace, Name: p.JobName}
+	key := types.NamespacedName{Namespace: p.Namespace, Name: p.JobName}
 	existing := &batchv1.Job{}
 	if err := r.Get(ctx, key, existing); err == nil {
 		return nil
@@ -739,13 +765,17 @@ func (r *FaultInjectionReconciler) createPodFaultJobIfNotExists(
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: fi.Namespace,
+			Namespace: p.Namespace,
 			Name:      p.JobName,
 			Labels: map[string]string{
 				"chaos.sghaida.io/fi":     fi.Name,
+				"chaos.sghaida.io/fi-uid": string(fi.UID),
 				"chaos.sghaida.io/kind":   "podfault",
-				"chaos.sghaida.io/action": sanitizeName(p.ActionName),
+				"chaos.sghaida.io/action": safeLabelValue(p.ActionName),
 				"chaos.sghaida.io/tick":   p.TickID,
+			},
+			Annotations: map[string]string{
+				"chaos.sghaida.io/fi-name": fi.Name,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -755,8 +785,17 @@ func (r *FaultInjectionReconciler) createPodFaultJobIfNotExists(
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"chaos.sghaida.io/fi":   fi.Name,
-						"chaos.sghaida.io/kind": "podfault",
+						"chaos.sghaida.io/fi":     fi.Name,
+						"chaos.sghaida.io/fi-uid": string(fi.UID),
+						"chaos.sghaida.io/kind":   "podfault",
+						"chaos.sghaida.io/action": safeLabelValue(p.ActionName),
+						"chaos.sghaida.io/tick":   safeLabelValue(p.TickID),
+					},
+					Annotations: map[string]string{
+						"chaos.sghaida.io/fi-name":          fi.Name,
+						"chaos.sghaida.io/fi-action":        p.ActionName,
+						"chaos.sghaida.io/tick-id":          p.TickID,
+						"chaos.sghaida.io/target-namespace": p.Namespace,
 					},
 				},
 				Spec: corev1.PodSpec{
@@ -885,10 +924,17 @@ func (r *FaultInjectionReconciler) recordPodFaultExecuted(
 func (r *FaultInjectionReconciler) cleanupPodFaultArtifacts(ctx context.Context, fi *chaosv1alpha1.FaultInjection) error {
 	// Jobs
 	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs, client.InNamespace(fi.Namespace), client.MatchingLabels{
+	lbls := map[string]string{
 		"chaos.sghaida.io/fi":   fi.Name,
 		"chaos.sghaida.io/kind": "podfault",
-	}); err != nil {
+	}
+	if fi.UID != "" {
+		lbls["chaos.sghaida.io/fi-uid"] = string(fi.UID)
+	}
+
+	if err := r.List(ctx, &jobs, client.InNamespace(fi.Namespace), client.MatchingLabels(
+		lbls,
+	)); err != nil {
 		r.eventf(fi, "Warning", "PodFaultJobListFailed", "podfault-cleanup",
 			"Failed listing podfault Jobs for cleanup: %v", err)
 		return err
@@ -907,10 +953,9 @@ func (r *FaultInjectionReconciler) cleanupPodFaultArtifacts(ctx context.Context,
 
 	// Leases
 	var leases coordv1.LeaseList
-	if err := r.List(ctx, &leases, client.InNamespace(fi.Namespace), client.MatchingLabels{
-		"chaos.sghaida.io/fi":   fi.Name,
-		"chaos.sghaida.io/kind": "podfault",
-	}); err != nil {
+	if err := r.List(ctx, &leases, client.InNamespace(fi.Namespace), client.MatchingLabels(
+		lbls,
+	)); err != nil {
 		r.eventf(fi, "Warning", "PodFaultLeaseListFailed", "podfault-cleanup",
 			"Failed listing podfault Leases for cleanup: %v", err)
 		return err
@@ -1058,11 +1103,31 @@ func computeWindowedTick(a chaosv1alpha1.PodFaultAction, now, startedAt time.Tim
 	return tickID, dueAt, true, &next, nil
 }
 
-func podFaultNames(fiName, actionName, tickID string) (jobName, leaseName string) {
-	actionSlug := sanitizeName(actionName)
-	jobName = fmt.Sprintf("fi-%s-pod-%s-%s", fiName, actionSlug, tickID)
-	leaseName = fmt.Sprintf("fi-%s-pod-%s-%s", fiName, actionSlug, tickID)
-	return
+func podFaultNames(fi *chaosv1alpha1.FaultInjection, actionName, tickID string) (jobName, leaseName string) {
+	// Preferred (human readable) format that matches old tests:
+	//   fi-<fi-name>-pod-<action>-<tick>
+	// Only fall back to hashed parts if we exceed the DNS_LABEL 63 char limit.
+	fiPart := sanitizeName(fi.Name)
+	actPart := sanitizeName(actionName)
+	tickPart := sanitizeName(tickID)
+
+	name := fmt.Sprintf("fi-%s-pod-%s-%s", fiPart, actPart, tickPart)
+	if len(name) <= 63 {
+		return name, name
+	}
+
+	// Fallback: guaranteed short and deterministic.
+	fiPart = fiShortID(fi)               // 10 chars
+	actPart = safeLabelValue(actionName) // must be <=63; ideally short/truncated+hash
+	tickPart = safeLabelValue(tickID)
+
+	name = fmt.Sprintf("fi-%s-pod-%s-%s", fiPart, actPart, tickPart)
+
+	// Absolute last safety: if safeLabelValue is buggy, hard-cap with hash.
+	if len(name) > 63 {
+		name = fmt.Sprintf("fi-%s-pod-%s-%s", fiShortID(fi), shortHash10(actionName), shortHash10(tickID))
+	}
+	return name, name
 }
 
 func updateEarliestDue(earliest **time.Time, candidate *time.Time) {

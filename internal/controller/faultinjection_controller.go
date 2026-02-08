@@ -301,6 +301,11 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.markRunning(ctx, log, &fi); err != nil {
 		return ctrl.Result{}, err
 	}
+	// markRunning() updates status via Status().Update() on a freshly fetched object.
+	// Reload so applyPodFaults sees the latest status (StartedAt/ExpiresAt/Phase/etc).
+	if err := r.Get(ctx, req.NamespacedName, &fi); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
 
 	podStop, nextDue, err := r.applyPodFaults(ctx, log, &fi, now)
 	if err != nil {
@@ -308,10 +313,6 @@ func (r *FaultInjectionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	if podStop {
 		return ctrl.Result{}, nil
-	}
-
-	if err := r.markRunning(ctx, log, &fi); err != nil {
-		return ctrl.Result{}, err
 	}
 
 	// Requeue should consider next windowed pod tick due (if any), not only expiry.
