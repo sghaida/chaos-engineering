@@ -29,12 +29,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-/*
-	===========================================================
-	MESH RELATED
-	===========================================================
-*/
-
 var _ = Describe("FaultInjection Controller - Mesh faults", func() {
 	ctx := context.Background()
 	const ns = "default"
@@ -832,12 +826,6 @@ var _ = Describe("FaultInjection Controller - Mesh faults", func() {
 	})
 })
 
-/*
-	===========================================================
-	POD RELATED
-	===========================================================
-*/
-
 var _ = Describe("FaultInjection Controller - Pod faults", func() {
 	ctx := context.Background()
 	const ns = "default"
@@ -1379,13 +1367,96 @@ var _ = Describe("FaultInjection Controller - Pod faults", func() {
 			return l.GetDeletionTimestamp() != nil
 		}, "10s", "100ms").Should(BeTrue(), "expected Lease to be deleted or at least marked for deletion")
 	})
+
 })
 
-/*
-	===========================================================
-	UTILS RELATED
-	===========================================================
-*/
+var _ = Describe("pod fault helper functions", func() {
+	Describe("validatePodFaultSelection", func() {
+		It("accepts COUNT with count>=1", func() {
+			c := int32(1)
+			a := chaosv1alpha1.PodFaultAction{
+				Name: "a1",
+				Selection: chaosv1alpha1.PodSelectionSpec{
+					Mode:  chaosv1alpha1.PodSelectionModeCount,
+					Count: &c,
+				},
+			}
+			Expect(validatePodFaultSelection(a)).To(Succeed())
+		})
+
+		It("rejects COUNT with nil or <=0", func() {
+			aNil := chaosv1alpha1.PodFaultAction{
+				Name: "a1",
+				Selection: chaosv1alpha1.PodSelectionSpec{
+					Mode: chaosv1alpha1.PodSelectionModeCount,
+				},
+			}
+			Expect(validatePodFaultSelection(aNil)).To(MatchError(ContainSubstring("invalid selection.count")))
+
+			c0 := int32(0)
+			a0 := chaosv1alpha1.PodFaultAction{
+				Name: "a2",
+				Selection: chaosv1alpha1.PodSelectionSpec{
+					Mode:  chaosv1alpha1.PodSelectionModeCount,
+					Count: &c0,
+				},
+			}
+			Expect(validatePodFaultSelection(a0)).To(MatchError(ContainSubstring("invalid selection.count")))
+		})
+
+		It("accepts PERCENT with 1..100", func() {
+			p := int32(10)
+			a := chaosv1alpha1.PodFaultAction{
+				Name: "a1",
+				Selection: chaosv1alpha1.PodSelectionSpec{
+					Mode:    chaosv1alpha1.PodSelectionModePercent,
+					Percent: &p,
+				},
+			}
+			Expect(validatePodFaultSelection(a)).To(Succeed())
+		})
+
+		It("rejects PERCENT with nil, <=0 or >100", func() {
+			aNil := chaosv1alpha1.PodFaultAction{
+				Name: "a1",
+				Selection: chaosv1alpha1.PodSelectionSpec{
+					Mode: chaosv1alpha1.PodSelectionModePercent,
+				},
+			}
+			Expect(validatePodFaultSelection(aNil)).To(MatchError(ContainSubstring("invalid selection.percent")))
+
+			p0 := int32(0)
+			a0 := chaosv1alpha1.PodFaultAction{
+				Name: "a2",
+				Selection: chaosv1alpha1.PodSelectionSpec{
+					Mode:    chaosv1alpha1.PodSelectionModePercent,
+					Percent: &p0,
+				},
+			}
+			Expect(validatePodFaultSelection(a0)).To(MatchError(ContainSubstring("invalid selection.percent")))
+
+			p101 := int32(101)
+			a101 := chaosv1alpha1.PodFaultAction{
+				Name: "a3",
+				Selection: chaosv1alpha1.PodSelectionSpec{
+					Mode:    chaosv1alpha1.PodSelectionModePercent,
+					Percent: &p101,
+				},
+			}
+			Expect(validatePodFaultSelection(a101)).To(MatchError(ContainSubstring("invalid selection.percent")))
+		})
+
+		It("rejects unsupported selection mode", func() {
+			a := chaosv1alpha1.PodFaultAction{
+				Name: "a1",
+				Selection: chaosv1alpha1.PodSelectionSpec{
+					Mode: chaosv1alpha1.PodSelectionMode("NOPE"),
+				},
+			}
+			Expect(validatePodFaultSelection(a)).To(MatchError(ContainSubstring("unsupported selection.mode")))
+		})
+	})
+})
 
 var _ = Describe("FaultInjection Controller - Utils", func() {
 	It("patchVirtualServiceHTTP removes multiple injected rules sharing the same prefix (not just one)", func() {
@@ -1614,9 +1685,224 @@ var _ = Describe("FaultInjection Controller - Utils", func() {
 	})
 })
 
+var _ = Describe("job condition helpers", func() {
+	It("detects JobComplete true", func() {
+		j := &batchv1.Job{
+			Status: batchv1.JobStatus{
+				Conditions: []batchv1.JobCondition{
+					{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		Expect(isJobComplete(j)).To(BeTrue())
+		Expect(isJobFailed(j)).To(BeFalse())
+	})
+
+	It("detects JobFailed true", func() {
+		j := &batchv1.Job{
+			Status: batchv1.JobStatus{
+				Conditions: []batchv1.JobCondition{
+					{Type: batchv1.JobFailed, Status: corev1.ConditionTrue},
+				},
+			},
+		}
+		Expect(isJobFailed(j)).To(BeTrue())
+		Expect(isJobComplete(j)).To(BeFalse())
+	})
+
+	It("returns false when conditions absent or not true", func() {
+		j := &batchv1.Job{}
+		Expect(isJobComplete(j)).To(BeFalse())
+		Expect(isJobFailed(j)).To(BeFalse())
+
+		j2 := &batchv1.Job{
+			Status: batchv1.JobStatus{
+				Conditions: []batchv1.JobCondition{
+					{Type: batchv1.JobComplete, Status: corev1.ConditionFalse},
+					{Type: batchv1.JobFailed, Status: corev1.ConditionFalse},
+				},
+			},
+		}
+		Expect(isJobComplete(j2)).To(BeFalse())
+		Expect(isJobFailed(j2)).To(BeFalse())
+	})
+})
+
+var _ = Describe("selectPodNamesDeterministically", func() {
+	It("returns nil for empty candidates", func() {
+		c := int32(1)
+		Expect(selectPodNamesDeterministically(nil, chaosv1alpha1.PodSelectionModeCount, &c, nil, 0)).To(BeNil())
+	})
+
+	It("COUNT nil => nil", func() {
+		cands := []unstructured.Unstructured{uPod("a")}
+		Expect(selectPodNamesDeterministically(cands, chaosv1alpha1.PodSelectionModeCount, nil, nil, 0)).To(BeNil())
+	})
+
+	It("COUNT clamps to n and maxPods", func() {
+		cands := []unstructured.Unstructured{uPod("a"), uPod("b"), uPod("c")}
+		c := int32(10)
+		Expect(selectPodNamesDeterministically(cands, chaosv1alpha1.PodSelectionModeCount, &c, nil, 0)).
+			To(Equal([]string{"a", "b", "c"}))
+
+		c2 := int32(3)
+		Expect(selectPodNamesDeterministically(cands, chaosv1alpha1.PodSelectionModeCount, &c2, nil, 2)).
+			To(Equal([]string{"a", "b"}))
+	})
+
+	It("PERCENT uses ceil and clamps", func() {
+		cands := []unstructured.Unstructured{uPod("a"), uPod("b"), uPod("c"), uPod("d"), uPod("e")}
+		p := int32(1) // ceil(5*1/100) = 1
+		Expect(selectPodNamesDeterministically(cands, chaosv1alpha1.PodSelectionModePercent, nil, &p, 0)).
+			To(Equal([]string{"a"}))
+
+		p2 := int32(21) // ceil(5*21/100)=ceil(1.05)=2
+		Expect(selectPodNamesDeterministically(cands, chaosv1alpha1.PodSelectionModePercent, nil, &p2, 0)).
+			To(Equal([]string{"a", "b"}))
+
+		p3 := int32(100)
+		Expect(selectPodNamesDeterministically(cands, chaosv1alpha1.PodSelectionModePercent, nil, &p3, 3)).
+			To(Equal([]string{"a", "b", "c"}))
+	})
+
+	It("unsupported mode yields nil", func() {
+		cands := []unstructured.Unstructured{uPod("a")}
+		c := int32(1)
+		Expect(selectPodNamesDeterministically(cands, chaosv1alpha1.PodSelectionMode("NOPE"), &c, nil, 0)).To(BeNil())
+	})
+})
+
+func testScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	Expect(chaosv1alpha1.AddToScheme(s)).To(Succeed())
+	Expect(batchv1.AddToScheme(s)).To(Succeed())
+	Expect(coordv1.AddToScheme(s)).To(Succeed())
+	Expect(corev1.AddToScheme(s)).To(Succeed())
+	return s
+}
+
+var _ = Describe("pod fault k8s helpers", func() {
+	var (
+		ctx context.Context
+		r   *FaultInjectionReconciler
+		fi  *chaosv1alpha1.FaultInjection
+		now time.Time
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		now = time.Now().UTC()
+
+		// IMPORTANT: build ONE scheme instance and reuse it everywhere in this test.
+		sch := testScheme()
+
+		fi = &chaosv1alpha1.FaultInjection{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: chaosv1alpha1.GroupVersion.String(),
+				Kind:       "FaultInjection",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "fi1",
+				Namespace: "demo",
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(sch).
+			WithObjects(fi).
+			WithStatusSubresource(fi). // REQUIRED because recordPodFaultPlanned/Executed use Status().Update
+			Build()
+
+		r = &FaultInjectionReconciler{
+			Client:   cl,
+			Scheme:   sch,            // reuse same scheme
+			Recorder: testRecorder(), // optional but nice
+		}
+	})
+
+	Describe("createPodFaultJobIfNotExists", func() {
+		It("creates the job and is idempotent", func() {
+			p := podFaultPlan{
+				ActionName:      "kill",
+				TickID:          "oneshot",
+				JobName:         "job1",
+				LeaseName:       "lease1",
+				Namespace:       "demo",
+				PodNames:        []string{"p1", "p2"},
+				TerminationMode: chaosv1alpha1.PodTerminationModeForceful,
+				GracePeriodSecs: 0,
+			}
+
+			Expect(r.createPodFaultJobIfNotExists(ctx, fi, p)).To(Succeed())
+
+			j := &batchv1.Job{}
+			Expect(r.Get(ctx, client.ObjectKey{Namespace: "demo", Name: "job1"}, j)).To(Succeed())
+			Expect(j.Spec.Template.Spec.ServiceAccountName).To(Equal("fi-podfault-executor"))
+
+			// Call again: should no-op
+			Expect(r.createPodFaultJobIfNotExists(ctx, fi, p)).To(Succeed())
+		})
+	})
+
+	Describe("recordPodFaultPlanned / recordPodFaultExecuted", func() {
+		It("upserts planned then executed, preserving planned pods", func() {
+			p := podFaultPlan{
+				ActionName: "kill",
+				TickID:     "0",
+				JobName:    "job-x",
+				PodNames:   []string{"p1", "p2"},
+			}
+
+			Expect(r.recordPodFaultPlanned(ctx, fi, p, now)).To(Succeed())
+
+			latest := &chaosv1alpha1.FaultInjection{}
+			Expect(r.Get(ctx, client.ObjectKeyFromObject(fi), latest)).To(Succeed())
+			Expect(latest.Status.PodFaults).To(HaveLen(1))
+			Expect(latest.Status.PodFaults[0].State).To(Equal("Planned"))
+			Expect(latest.Status.PodFaults[0].PlannedPods).To(Equal([]string{"p1", "p2"}))
+
+			// executed with different p.PodNames should NOT override planned pods if already set
+			p2 := p
+			p2.PodNames = []string{"p9"}
+
+			Expect(r.recordPodFaultExecuted(ctx, fi, p2, now.Add(time.Second), true, "ok")).To(Succeed())
+
+			latest2 := &chaosv1alpha1.FaultInjection{}
+			Expect(r.Get(ctx, client.ObjectKeyFromObject(fi), latest2)).To(Succeed())
+			Expect(latest2.Status.PodFaults).To(HaveLen(1))
+			Expect(latest2.Status.PodFaults[0].State).To(Equal("Succeeded"))
+			Expect(latest2.Status.PodFaults[0].Message).To(Equal("ok"))
+			Expect(latest2.Status.PodFaults[0].PlannedPods).To(Equal([]string{"p1", "p2"}))
+		})
+
+		It("records executed pods if planned pods were not recorded", func() {
+			p := podFaultPlan{
+				ActionName: "kill",
+				TickID:     "0",
+				JobName:    "job-x",
+				PodNames:   []string{"p1"},
+			}
+
+			Expect(r.recordPodFaultExecuted(ctx, fi, p, now, false, "boom")).To(Succeed())
+
+			latest := &chaosv1alpha1.FaultInjection{}
+			Expect(r.Get(ctx, client.ObjectKeyFromObject(fi), latest)).To(Succeed())
+			Expect(latest.Status.PodFaults).To(HaveLen(1))
+			Expect(latest.Status.PodFaults[0].State).To(Equal("Failed"))
+			Expect(latest.Status.PodFaults[0].PlannedPods).To(Equal([]string{"p1"}))
+		})
+	})
+})
+
 /* -----------------------------
    Test-only helpers
 --------------------------------*/
+
+func uPod(name string) unstructured.Unstructured {
+	var u unstructured.Unstructured
+	u.SetName(name)
+	return u
+}
 
 func testNewVirtualService(namespace, name string) *unstructured.Unstructured {
 	vs := &unstructured.Unstructured{}
