@@ -275,7 +275,8 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 				}
 
 				// delete job right after we recorded outcome (keeps namespace clean).
-				if derr := r.Delete(ctx, job); derr != nil && !apierrors.IsNotFound(derr) {
+				bg := metav1.DeletePropagationBackground
+				if derr := r.Delete(ctx, job, client.PropagationPolicy(bg)); derr != nil && !apierrors.IsNotFound(derr) {
 					r.eventf(fi, "Warning", "PodFaultJobDeleteFailed", "podfault-cleanup",
 						"Failed deleting completed podfault Job %s/%s: %v", job.Namespace, job.Name, derr)
 					// don’t fail the whole reconcile; status already recorded
@@ -297,7 +298,8 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 				}
 
 				// delete job right after we recorded outcome.
-				if derr := r.Delete(ctx, job); derr != nil && !apierrors.IsNotFound(derr) {
+				bg := metav1.DeletePropagationBackground
+				if derr := r.Delete(ctx, job, client.PropagationPolicy(bg)); derr != nil && !apierrors.IsNotFound(derr) {
 					r.eventf(fi, "Warning", "PodFaultJobDeleteFailed", "podfault-cleanup",
 						"Failed deleting failed podfault Job %s/%s: %v", job.Namespace, job.Name, derr)
 				}
@@ -825,7 +827,7 @@ func (r *FaultInjectionReconciler) createPodFaultJobIfNotExists(
 				"chaos.sghaida.io/fi-uid": string(fi.UID),
 				"chaos.sghaida.io/kind":   "podfault",
 				"chaos.sghaida.io/action": safeLabelValue(p.ActionName),
-				"chaos.sghaida.io/tick":   p.TickID,
+				"chaos.sghaida.io/tick":   safeLabelValue(p.TickID),
 			},
 			Annotations: map[string]string{
 				"chaos.sghaida.io/fi-name": fi.Name,
@@ -997,13 +999,40 @@ func (r *FaultInjectionReconciler) cleanupPodFaultArtifacts(ctx context.Context,
 
 	for i := range jobs.Items {
 		j := jobs.Items[i].DeepCopy()
-		if err := r.Delete(ctx, j); err != nil && !apierrors.IsNotFound(err) {
+		bg := metav1.DeletePropagationBackground
+		if err := r.Delete(ctx, j, client.PropagationPolicy(bg)); err != nil && !apierrors.IsNotFound(err) {
 			r.eventf(fi, "Warning", "PodFaultJobDeleteFailed", "podfault-cleanup",
 				"Failed deleting podfault Job %s/%s: %v", j.Namespace, j.Name, err)
 			continue
 		}
 		r.eventf(fi, "Normal", "PodFaultJobDeleted", "podfault-cleanup",
 			"Deleted podfault Job %s/%s", j.Namespace, j.Name)
+	}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(fi.Namespace),
+		client.MatchingLabels(lbls),
+	); err != nil {
+		r.eventf(fi, "Warning", "PodFaultPodListFailed", "podfault-cleanup",
+			"Failed listing podfault executor Pods for cleanup: %v", err)
+		return err
+	}
+
+	for i := range pods.Items {
+		p := pods.Items[i].DeepCopy()
+		// only delete succeeded/failed pods;
+		if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
+			continue
+		}
+
+		if err := r.Delete(ctx, p); err != nil && !apierrors.IsNotFound(err) {
+			r.eventf(fi, "Warning", "PodFaultPodDeleteFailed", "podfault-cleanup",
+				"Failed deleting podfault executor Pod %s/%s: %v", p.Namespace, p.Name, err)
+			continue
+		}
+		r.eventf(fi, "Normal", "PodFaultPodDeleted", "podfault-cleanup",
+			"Deleted podfault executor Pod %s/%s", p.Namespace, p.Name)
 	}
 
 	// Leases
