@@ -262,3 +262,31 @@ func safeLabelValue(s string) string {
 	}
 	return slug[:cut] + "-" + shortHash10(slug)[:10]
 }
+
+func findPodFaultTickStatus(st *chaosv1alpha1.FaultInjectionStatus, actionName, tickID string) *chaosv1alpha1.PodFaultTickStatus {
+	for i := range st.PodFaults {
+		if st.PodFaults[i].ActionName == actionName && st.PodFaults[i].TickID == tickID {
+			return &st.PodFaults[i]
+		}
+	}
+	return nil
+}
+
+func isTerminalTickState(state string) bool {
+	return state == PodFaultStateSucceeded || state == PodFaultStateFailed
+}
+
+func podFaultTickAlreadyExecuted(st *chaosv1alpha1.FaultInjectionStatus, actionName, tickID string) bool {
+	for i := range st.PodFaults {
+		e := st.PodFaults[i]
+		if e.ActionName == actionName && e.TickID == tickID {
+			if e.ExecutedAt != nil {
+				return true
+			}
+			if e.State == PodFaultStateSucceeded || e.State == PodFaultStateFailed {
+				return true
+			}
+		}
+	}
+	return false
+}

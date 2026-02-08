@@ -40,6 +40,12 @@ const (
 	defaultPodFaultJobActiveDeadlineSeconds   int64 = 120
 	defaultPodFaultJobTTLSecondsAfterFinished int32 = 300
 	defaultPodFaultJobBackoffLimit            int32 = 0
+	// PodFaultStatePlanned Planed
+	PodFaultStatePlanned = "Planned"
+	// PodFaultStateSucceeded Succeeded
+	PodFaultStateSucceeded = "Succeeded"
+	// PodFaultStateFailed Failed
+	PodFaultStateFailed = "Failed"
 )
 
 // validatePodFaults validates pod-fault actions for reconciler safety.
@@ -251,6 +257,16 @@ func (r *FaultInjectionReconciler) applyPodFaults(
 	pending := false
 
 	for _, p := range plans {
+		// ✅ ONE_SHOT: if already executed, skip forever.
+		if p.TickID == "oneshot" && podFaultTickAlreadyExecuted(&fi.Status, p.ActionName, p.TickID) {
+			continue
+		}
+		// If we've already completed this (action,tick), do not re-run.
+		if cur := findPodFaultTickStatus(&fi.Status, p.ActionName, p.TickID); cur != nil {
+			if isTerminalTickState(cur.State) {
+				continue
+			}
+		}
 		// 1) If Job exists => observe its state.
 		job := &batchv1.Job{}
 		jobKey := types.NamespacedName{Namespace: p.Namespace, Name: p.JobName}
@@ -912,10 +928,17 @@ func (r *FaultInjectionReconciler) recordPodFaultPlanned(
 		}
 
 		e := upsertPodFaultTickStatus(&latest.Status, p.ActionName, p.TickID)
+
+		// ✅ IMPORTANT: don't overwrite a terminal/finished tick
+		if e.State == PodFaultStateSucceeded || e.State == PodFaultStateFailed || e.ExecutedAt != nil {
+			return nil
+		}
+
+		// Normal "planned" write
 		e.PlannedAt = &tNow
 		e.PlannedPods = append([]string(nil), p.PodNames...) // copy
 		e.JobName = p.JobName
-		e.State = "Planned"
+		e.State = PodFaultStatePlanned
 		e.Message = ""
 
 		return r.Status().Update(ctx, &latest)
@@ -942,9 +965,9 @@ func (r *FaultInjectionReconciler) recordPodFaultExecuted(
 	key := client.ObjectKeyFromObject(fi)
 	tNow := metav1.NewTime(now.UTC())
 
-	state := "Failed"
+	state := PodFaultStateFailed
 	if succeeded {
-		state = "Succeeded"
+		state = PodFaultStateSucceeded
 	}
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
