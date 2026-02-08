@@ -1021,7 +1021,7 @@ func (r *FaultInjectionReconciler) cleanupPodFaultArtifacts(ctx context.Context,
 
 	for i := range pods.Items {
 		p := pods.Items[i].DeepCopy()
-		// only delete succeeded/failed pods;
+		// Only delete pods that look like our executor pods.
 		if p.Status.Phase != corev1.PodSucceeded && p.Status.Phase != corev1.PodFailed {
 			continue
 		}
