@@ -803,11 +803,47 @@ func (r *FaultInjectionReconciler) createPodFaultJobIfNotExists(
 					ServiceAccountName: "fi-podfault-executor",
 					Containers: []corev1.Container{
 						{
-							Name:    "executor",
-							Image:   "REPLACE_ME_EXECUTOR_IMAGE",
+							Name: "executor",
+							// TODO: think later which image to use for the job
+							// this is added for the test script to run
+							// alpine:3.20 might be better option
+							// this should be passed using env to make it more flexable
+							Image:   "bitnami/kubectl:1.29",
 							Command: []string{"/bin/sh", "-lc"},
+							// TODO: the script should be passed from script and use embed
+							// for the time being keep it there for the sake of POC
+
 							Args: []string{
-								"echo 'TODO: implement podfault executor'; sleep 1",
+								`
+								set -euo pipefail
+
+								echo "FI_NAME=$FI_NAME ACTION_NAME=$ACTION_NAME TICK_ID=$TICK_ID"
+								echo "TARGET_NAMESPACE=$TARGET_NAMESPACE"
+								echo "POD_NAMES_CSV=$POD_NAMES_CSV"
+								echo "TERMINATION_MODE=$TERMINATION_MODE GRACE_PERIOD_SECONDS=$GRACE_PERIOD_SECONDS"
+
+								IFS=',' read -r -a PODS <<< "${POD_NAMES_CSV:-}"
+								if [ "${#PODS[@]}" -eq 0 ]; then
+								echo "no pods to delete; exiting 0"
+								exit 0
+								fi
+
+								# Decide grace period
+								GRACE="${GRACE_PERIOD_SECONDS:-0}"
+								if [ "${TERMINATION_MODE:-}" = "FORCEFUL" ]; then
+								GRACE="0"
+								fi
+
+								for p in "${PODS[@]}"; do
+								p="$(echo "$p" | xargs)" # trim
+								[ -z "$p" ] && continue
+
+								echo "deleting pod ${TARGET_NAMESPACE}/${p} (grace=${GRACE})"
+								kubectl -n "$TARGET_NAMESPACE" delete pod "$p" --ignore-not-found=true --grace-period="$GRACE"
+								done
+
+								echo "done"
+								`,
 							},
 							Env: []corev1.EnvVar{
 								{Name: "FI_NAME", Value: fi.Name},
